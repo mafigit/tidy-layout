@@ -274,3 +274,151 @@ fn every_route_joins_its_cards_and_stays_out_of_all_cards() {
     }
     assert_eq!((routes_checked, lines), (3758, 1045));
 }
+
+/// What lies wrong with the labels of an answer, in words: a label on a card, on another label,
+/// or crossed by the line of a connection (its own or another). A pixel of overlap does not count.
+fn label_trouble(request: &RouteRequest, answer: &tidy_layout::api::RouteResponse) -> Vec<String> {
+    struct Rect(f64, f64, f64, f64);
+    let overlap = |a: &Rect, b: &Rect| a.0 < b.2 - 1.0 && b.0 < a.2 - 1.0 && a.1 < b.3 - 1.0 && b.1 < a.3 - 1.0;
+    let boxes: Vec<Option<Rect>> = answer
+        .labels
+        .iter()
+        .zip(&request.connections)
+        .map(|(place, connection)| {
+            let (place, size) = ((*place)?, connection.label?);
+            Some(Rect(place.x, place.y, place.x + size.width, place.y + size.height))
+        })
+        .collect();
+    let mut found = Vec::new();
+    for (i, label) in boxes.iter().enumerate() {
+        let Some(label) = label else { continue };
+        for card in &request.cards {
+            if overlap(label, &Rect(card.x, card.y, card.x + card.width, card.y + card.height)) {
+                found.push(format!("label {i} lies on card {}", card.id));
+            }
+        }
+        for (j, other) in boxes.iter().enumerate().skip(i + 1) {
+            if other.as_ref().is_some_and(|other| overlap(label, other)) {
+                found.push(format!("label {i} lies on label {j}"));
+            }
+        }
+        for (j, route) in answer.routes.iter().enumerate() {
+            let crossed = route.windows(2).any(|piece| {
+                let line = Rect(
+                    piece[0].x.min(piece[1].x),
+                    piece[0].y.min(piece[1].y),
+                    piece[0].x.max(piece[1].x),
+                    piece[0].y.max(piece[1].y),
+                );
+                // A line has no width: it crosses when it passes more than a pixel inside.
+                line.0 < label.2 - 1.0 && line.2 > label.0 + 1.0 && line.1 < label.3 - 1.0 && line.3 > label.1 + 1.0
+            });
+            if crossed {
+                found.push(format!("label {i} is crossed by the line of connection {j}"));
+            }
+        }
+    }
+    found
+}
+
+/// Where the ported placement alone puts the labels of a request: TALA's places, before `route`
+/// moves any. For requests without a connection from a card to itself.
+fn ported_places(request: &RouteRequest) -> Vec<Option<Position>> {
+    use tidy_layout::graph::{Edge, Graph, Node, Point};
+    use tidy_layout::routing::coordinator::route_edges_with_labels;
+    use tidy_layout::routing::labels::LabelSize;
+    let index = |id: &str| request.cards.iter().position(|card| card.id == id).unwrap();
+    let nodes = request.cards.iter().map(|c| Node { top_left: Point { x: c.x, y: c.y }, width: c.width, height: c.height }).collect();
+    let edges = request.connections.iter().map(|c| Edge::plain(index(&c.from), index(&c.to))).collect();
+    let sizes: Vec<Option<LabelSize>> =
+        request.connections.iter().map(|c| c.label.map(|label| LabelSize { width: label.width, height: label.height })).collect();
+    let graph = Graph { slanted_lines: false, ..Graph::new(nodes, edges) };
+    let routing = route_edges_with_labels(&graph, &sizes).unwrap();
+    routing.labels.iter().map(|place| place.map(|place| Position { x: place.top_left.x, y: place.top_left.y })).collect()
+}
+
+/// Ours, where TALA differs: three connections run side by side, 30 apart, and TALA's placement
+/// leaves the label of the middle one on its own line. `route` moves it up beside the line.
+#[test]
+fn a_label_under_a_line_moves_to_the_nearest_free_place_beside_its_own_line() {
+    let request = request(json!({
+        "cards": [card("a", 1220.0, 160.0), card("b", 400.0, 160.0), card("c", 0.0, 220.0)],
+        "connections": [
+            { "from": "a", "to": "b", "label": { "width": 159, "height": 22 } },
+            { "from": "b", "to": "a", "label": { "width": 128, "height": 22 } },
+            { "from": "a", "to": "b", "label": { "width": 83, "height": 22 } },
+        ],
+    }));
+    let ported = ported_places(&request);
+    // The middle connection runs level at y = 220; its label lay from 209 to 231.
+    assert_eq!(ported[0], Some(Position { x: 841.0, y: 209.0 }));
+    let answer = route(&request).unwrap();
+    // Now it ends 6 above the line. The other two labels keep TALA's places.
+    assert_eq!(answer.labels[0], Some(Position { x: 841.0, y: 192.0 }));
+    assert_eq!(answer.labels[1..], ported[1..]);
+    assert_eq!(label_trouble(&request, &answer), Vec::<String>::new());
+}
+
+/// A diagram of 23 cards as an editor had it. Three lines run upright 55 apart, and the label of
+/// the middle one is 183 wide: no place beside its line is free, so it stays where TALA put it,
+/// under the line of another connection. Every other label is clear.
+#[test]
+fn a_label_with_no_free_place_beside_its_line_stays_where_it_was() {
+    let request: RouteRequest = serde_json::from_str(include_str!("fixtures/crossed-label.json")).unwrap();
+    let answer = route(&request).unwrap();
+    assert_eq!(answer.labels, ported_places(&request));
+    assert_eq!(label_trouble(&request, &answer), vec!["label 6 is crossed by the line of connection 23".to_string()]);
+}
+
+/// Whatever the layout: a label is where TALA's placement put it, or it was under a line there
+/// and is now clear of every line, card and other label. So moving never makes a drawing worse,
+/// and over many layouts it clears a good part of the labels that were under a line.
+#[test]
+fn a_moved_label_is_always_clear_and_no_other_label_moves() {
+    let mut random = Random(20261124);
+    let (mut under_a_line, mut cleared) = (0, 0);
+    for round in 0..400 {
+        let gap = if round % 2 == 0 { 60.0 } else { 20.0 };
+        let mut places: Vec<(f64, f64)> = Vec::new();
+        let wanted = 3 + random.below(8) as usize;
+        let mut tries = 0;
+        while places.len() < wanted && tries < 400 {
+            tries += 1;
+            let place = (20.0 * random.below(70) as f64, 20.0 * random.below(45) as f64);
+            if places.iter().all(|other| (place.0 - other.0).abs() >= 220.0 + gap || (place.1 - other.1).abs() >= 120.0 + gap) {
+                places.push(place);
+            }
+        }
+        let cards: Vec<Value> = places.iter().enumerate().map(|(n, p)| card(&n.to_string(), p.0, p.1)).collect();
+        let mut wires: Vec<Value> = Vec::new();
+        for _ in 0..random.below(2 * places.len() as u64) {
+            let (from, to) = (random.below(places.len() as u64), random.below(places.len() as u64));
+            if from != to {
+                let width = 60 + random.below(180);
+                wires.push(json!({ "from": from.to_string(), "to": to.to_string(), "label": { "width": width, "height": 22 } }));
+            }
+        }
+        let request = request(json!({ "cards": cards, "connections": wires }));
+        let answer = route(&request).unwrap();
+        let ported = ported_places(&request);
+        // The same answer with TALA's places: what was wrong before any label moved.
+        let before = tidy_layout::api::RouteResponse { routes: answer.routes.clone(), labels: ported.clone() };
+        let (was, is) = (label_trouble(&request, &before), label_trouble(&request, &answer));
+        let crossed = |trouble: &[String], label: usize| trouble.iter().any(|line| line.starts_with(&format!("label {label} is crossed")));
+        let any = |trouble: &[String], label: usize| {
+            trouble.iter().any(|line| line.starts_with(&format!("label {label} ")) || line.ends_with(&format!("on label {label}")))
+        };
+        for label in 0..ported.len() {
+            if crossed(&was, label) {
+                under_a_line += 1;
+            }
+            if answer.labels[label] != ported[label] {
+                assert!(crossed(&was, label), "label {label} moved though no line crossed it: {request_text}", request_text = json!({ "cards": cards, "connections": wires }));
+                assert!(!any(&is, label), "label {label} moved to a place that is not clear: {is:?}");
+                cleared += 1;
+            }
+        }
+    }
+    // Pinned: counted once, 2026-11-24. A change here means the search finds other places.
+    assert_eq!((under_a_line, cleared), (144, 61));
+}

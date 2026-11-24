@@ -139,6 +139,104 @@ pub fn snap(request: &SnapRequest) -> Result<SnapResponse, String> {
     Ok(SnapResponse { x: place.x, y: place.y, ring: rings.round() as u32 })
 }
 
+/// A box with its sides level and upright: a card or a label.
+#[derive(Clone, Copy)]
+struct Area {
+    left: f64,
+    top: f64,
+    right: f64,
+    bottom: f64,
+}
+
+impl Area {
+    fn of_label(place: Point, size: labels::LabelSize) -> Area {
+        Area { left: place.x, top: place.y, right: place.x + size.width, bottom: place.y + size.height }
+    }
+
+    /// Whether the two share more than `slack` in both directions.
+    fn overlaps(&self, other: &Area, slack: f64) -> bool {
+        self.left < other.right - slack && other.left < self.right - slack && self.top < other.bottom - slack && other.top < self.bottom - slack
+    }
+
+    /// Whether the piece of a route from `a` to `b` (level or upright) passes through the box,
+    /// more than `slack` inside it.
+    fn crossed_by(&self, a: Point, b: Point, slack: f64) -> bool {
+        let line = Area { left: a.x.min(b.x), top: a.y.min(b.y), right: a.x.max(b.x), bottom: a.y.max(b.y) };
+        line.left < self.right - slack && line.right > self.left + slack && line.top < self.bottom - slack && line.bottom > self.top + slack
+    }
+}
+
+/// How far a label's box keeps from its line: half the line's thickness and the padding, as
+/// the ported placement keeps it (`routing::labels`).
+const LABEL_OFF_LINE: f64 = 1.5 + LABEL_PADDING;
+/// A label on a line counts as crossed when the line passes more than this inside its box.
+const CROSSED_SLACK: f64 = 1.0;
+/// How far apart the places are that a label is tried at along its line.
+const LABEL_STEP: f64 = 4.0;
+
+/// Ours, not TALA's: no label stays under the line of a connection. TALA's placement takes the
+/// place that covers the least, and where every place it tries covers something it leaves the
+/// label on another connection's line. Such a label moves to the nearest place beside its own
+/// line, on either side of any of its pieces, that lies on no card, on no other label and
+/// under no line. Where there is none it stays. The routes do not change.
+fn uncross_labels(cards: &[Node], routes: &[Vec<Point>], sizes: &[Option<labels::LabelSize>], places: &mut [Option<Point>]) {
+    let card_areas: Vec<Area> = cards
+        .iter()
+        .map(|card| Area { left: card.top_left.x, top: card.top_left.y, right: card.top_left.x + card.width, bottom: card.top_left.y + card.height })
+        .collect();
+    let under_a_line =
+        |area: &Area, slack: f64| routes.iter().any(|route| route.windows(2).any(|piece| area.crossed_by(piece[0], piece[1], slack)));
+    for label in 0..places.len() {
+        let (Some(place), Some(size)) = (places[label], sizes[label]) else { continue };
+        if !under_a_line(&Area::of_label(place, size), CROSSED_SLACK) {
+            continue;
+        }
+        let others: Vec<Area> = (0..places.len())
+            .filter(|other| *other != label)
+            .filter_map(|other| Some(Area::of_label(places[other]?, sizes[other]?)))
+            .collect();
+        let free = |at: Point| {
+            let area = Area::of_label(at, size);
+            !under_a_line(&area, 0.0)
+                && card_areas.iter().all(|card| !area.overlaps(card, 0.0))
+                && others.iter().all(|other| !area.overlaps(other, 0.0))
+        };
+        let mut best: Option<(f64, Point)> = None;
+        for piece in routes[label].windows(2) {
+            let (a, b) = (piece[0], piece[1]);
+            let level = a.y == b.y;
+            // Along the piece: the label may reach past either end by half its length, so that
+            // its middle is still beside the piece. That also gives a short piece its places.
+            let (from, to, length) = if level { (a.x.min(b.x), a.x.max(b.x), size.width) } else { (a.y.min(b.y), a.y.max(b.y), size.height) };
+            let mut along = Vec::new();
+            let mut at = from - length / 2.0;
+            while at <= to - length / 2.0 {
+                along.push(at);
+                at += LABEL_STEP;
+            }
+            for at in along {
+                let sides = if level {
+                    [Point { x: at, y: a.y - LABEL_OFF_LINE - size.height }, Point { x: at, y: a.y + LABEL_OFF_LINE }]
+                } else {
+                    [Point { x: a.x - LABEL_OFF_LINE - size.width, y: at }, Point { x: a.x + LABEL_OFF_LINE, y: at }]
+                };
+                for corner in sides {
+                    // Whole numbers, as the ported places are.
+                    let corner = Point { x: corner.x.round(), y: corner.y.round() };
+                    let moved = (corner.x - place.x).hypot(corner.y - place.y);
+                    // The first of equally near places stays: the answer never depends on chance.
+                    if best.is_none_or(|(least, _)| moved < least) && free(corner) {
+                        best = Some((moved, corner));
+                    }
+                }
+            }
+        }
+        if let Some((_, corner)) = best {
+            places[label] = Some(corner);
+        }
+    }
+}
+
 /// "How do the connectors run?"
 #[derive(Deserialize)]
 pub struct RouteRequest {
@@ -214,7 +312,9 @@ pub fn route(request: &RouteRequest) -> Result<RouteResponse, String> {
     }
     let graph = Graph { slanted_lines: false, ..Graph::new(nodes, edges) };
     let routing = route_edges_with_labels(&graph, &sizes).map_err(|error| format!("no route found: {error:?}"))?;
-    let (kept, places) = (routing.routes, routing.labels);
+    let kept = routing.routes;
+    let mut places: Vec<Option<Point>> = routing.labels.iter().map(|place| place.map(|place| place.top_left)).collect();
+    uncross_labels(&graph.nodes, &kept, &sizes, &mut places);
     let routes = edge_of
         .iter()
         .map(|edge| match edge {
@@ -224,7 +324,7 @@ pub fn route(request: &RouteRequest) -> Result<RouteResponse, String> {
         .collect();
     let labels = edge_of
         .iter()
-        .map(|edge| edge.and_then(|edge| places[edge]).map(|place| Position { x: place.top_left.x, y: place.top_left.y }))
+        .map(|edge| edge.and_then(|edge| places[edge]).map(|place| Position { x: place.x, y: place.y }))
         .collect();
     Ok(RouteResponse { routes, labels })
 }
