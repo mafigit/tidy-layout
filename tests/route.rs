@@ -272,7 +272,9 @@ fn every_route_joins_its_cards_and_stays_out_of_all_cards() {
             lines += usize::from(route.len() == 2);
         }
     }
-    assert_eq!((routes_checked, lines), (3758, 1045));
+    // 1045 of them are straight lines as TALA routes them; pulling shared lines apart takes a
+    // jog out of two more.
+    assert_eq!((routes_checked, lines), (3758, 1047));
 }
 
 /// What lies wrong with the labels of an answer, in words: a label on a card, on another label,
@@ -321,9 +323,9 @@ fn label_trouble(request: &RouteRequest, answer: &tidy_layout::api::RouteRespons
     found
 }
 
-/// Where the ported placement alone puts the labels of a request: TALA's places, before `route`
-/// moves any. For requests without a connection from a card to itself.
-fn ported_places(request: &RouteRequest) -> Vec<Option<Position>> {
+/// What the ported code alone answers: TALA's routes and TALA's places for the labels, before
+/// `route` changes any. For requests without a connection from a card to itself.
+fn ported(request: &RouteRequest) -> tidy_layout::api::RouteResponse {
     use tidy_layout::graph::{Edge, Graph, Node, Point};
     use tidy_layout::routing::coordinator::route_edges_with_labels;
     use tidy_layout::routing::labels::LabelSize;
@@ -334,7 +336,14 @@ fn ported_places(request: &RouteRequest) -> Vec<Option<Position>> {
         request.connections.iter().map(|c| c.label.map(|label| LabelSize { width: label.width, height: label.height })).collect();
     let graph = Graph { slanted_lines: false, ..Graph::new(nodes, edges) };
     let routing = route_edges_with_labels(&graph, &sizes).unwrap();
-    routing.labels.iter().map(|place| place.map(|place| Position { x: place.top_left.x, y: place.top_left.y })).collect()
+    tidy_layout::api::RouteResponse {
+        routes: routing.routes.iter().map(|route| route.iter().map(|p| Position { x: p.x, y: p.y }).collect()).collect(),
+        labels: routing.labels.iter().map(|place| place.map(|place| Position { x: place.top_left.x, y: place.top_left.y })).collect(),
+    }
+}
+
+fn ported_places(request: &RouteRequest) -> Vec<Option<Position>> {
+    ported(request).labels
 }
 
 /// Ours, where TALA differs: three connections run side by side, 30 apart, and TALA's placement
@@ -370,13 +379,13 @@ fn a_label_with_no_free_place_beside_its_line_stays_where_it_was() {
     assert_eq!(label_trouble(&request, &answer), vec!["label 6 is crossed by the line of connection 23".to_string()]);
 }
 
-/// Whatever the layout: a label is where TALA's placement put it, or it was under a line there
-/// and is now clear of every line, card and other label. So moving never makes a drawing worse,
-/// and over many layouts it clears a good part of the labels that were under a line.
+/// Whatever the layout: with the lines pulled apart and the labels moved, far fewer labels lie
+/// under a line than in TALA's own answer, and no more lie on a card or on another label.
 #[test]
-fn a_moved_label_is_always_clear_and_no_other_label_moves() {
+fn labels_lie_under_fewer_lines_than_in_talas_answer() {
     let mut random = Random(20261124);
-    let (mut under_a_line, mut cleared) = (0, 0);
+    let count = |trouble: &[String], what: &str| trouble.iter().filter(|line| line.contains(what)).count();
+    let (mut crossed, mut covering) = ((0, 0), (0, 0));
     for round in 0..400 {
         let gap = if round % 2 == 0 { 60.0 } else { 20.0 };
         let mut places: Vec<(f64, f64)> = Vec::new();
@@ -399,26 +408,170 @@ fn a_moved_label_is_always_clear_and_no_other_label_moves() {
             }
         }
         let request = request(json!({ "cards": cards, "connections": wires }));
-        let answer = route(&request).unwrap();
-        let ported = ported_places(&request);
-        // The same answer with TALA's places: what was wrong before any label moved.
-        let before = tidy_layout::api::RouteResponse { routes: answer.routes.clone(), labels: ported.clone() };
-        let (was, is) = (label_trouble(&request, &before), label_trouble(&request, &answer));
-        let crossed = |trouble: &[String], label: usize| trouble.iter().any(|line| line.starts_with(&format!("label {label} is crossed")));
-        let any = |trouble: &[String], label: usize| {
-            trouble.iter().any(|line| line.starts_with(&format!("label {label} ")) || line.ends_with(&format!("on label {label}")))
-        };
-        for label in 0..ported.len() {
-            if crossed(&was, label) {
-                under_a_line += 1;
+        let (was, is) = (label_trouble(&request, &ported(&request)), label_trouble(&request, &route(&request).unwrap()));
+        crossed = (crossed.0 + count(&was, "is crossed"), crossed.1 + count(&is, "is crossed"));
+        covering = (covering.0 + count(&was, "lies on"), covering.1 + count(&is, "lies on"));
+    }
+    // Pinned: counted once, 2026-11-24, as (TALA's answer, ours). A label under two lines
+    // counts twice. A change here means lines or labels go to other places.
+    assert_eq!((crossed, covering), ((153, 103), (94, 93)));
+}
+
+/// Which routes lie on each other, in words: two connections with pieces on one line that share
+/// more than a pixel of it, or with an end at the same point.
+fn shared_lines(answer: &tidy_layout::api::RouteResponse) -> Vec<String> {
+    let mut found = Vec::new();
+    for (i, first) in answer.routes.iter().enumerate() {
+        for (j, second) in answer.routes.iter().enumerate().skip(i + 1) {
+            if first.is_empty() || second.is_empty() {
+                continue;
             }
-            if answer.labels[label] != ported[label] {
-                assert!(crossed(&was, label), "label {label} moved though no line crossed it: {request_text}", request_text = json!({ "cards": cards, "connections": wires }));
-                assert!(!any(&is, label), "label {label} moved to a place that is not clear: {is:?}");
-                cleared += 1;
+            for end in [first[0], *first.last().unwrap()] {
+                if end == second[0] || end == *second.last().unwrap() {
+                    found.push(format!("connections {i} and {j} end at the same point {end:?}"));
+                }
+            }
+            let mut shared = 0.0;
+            for a in first.windows(2) {
+                for b in second.windows(2) {
+                    let upright = |piece: &[Position]| piece[0].x == piece[1].x;
+                    let level = |piece: &[Position]| piece[0].y == piece[1].y;
+                    let along = |from: f64, to: f64, other_from: f64, other_to: f64| {
+                        (from.max(to).min(other_from.max(other_to)) - from.min(to).max(other_from.min(other_to))).max(0.0)
+                    };
+                    if upright(a) && upright(b) && (a[0].x - b[0].x).abs() < 0.5 {
+                        shared += along(a[0].y, a[1].y, b[0].y, b[1].y);
+                    } else if level(a) && level(b) && (a[0].y - b[0].y).abs() < 0.5 {
+                        shared += along(a[0].x, a[1].x, b[0].x, b[1].x);
+                    }
+                }
+            }
+            if shared > 1.0 {
+                found.push(format!("connections {i} and {j} share {shared} of a line"));
             }
         }
     }
-    // Pinned: counted once, 2026-11-24. A change here means the search finds other places.
-    assert_eq!((under_a_line, cleared), (144, 61));
+    found
+}
+
+/// Ours, where TALA differs: two connections leave a card at the same point and share the line
+/// down to where the first turns off. `route` gives each its own line, 16 apart, the one that
+/// turns off first on the side it turns to, so the two never cross.
+#[test]
+fn two_connections_from_one_card_keep_their_own_lines() {
+    let answer = route(&request(json!({
+        "cards": [card("a", 260.0, 0.0), card("b", 1000.0, 220.0), card("c", 900.0, 620.0)],
+        "connections": [{ "from": "a", "to": "b" }, { "from": "a", "to": "c" }],
+    })))
+    .unwrap();
+    // TALA: both down x = 370 from (370, 120), the first to y = 280, the second to y = 680.
+    assert_eq!(points(&answer.routes[0]), vec![(378.0, 120.0), (378.0, 280.0), (1000.0, 280.0)]);
+    assert_eq!(points(&answer.routes[1]), vec![(362.0, 120.0), (362.0, 680.0), (900.0, 680.0)]);
+    assert_eq!(shared_lines(&answer), Vec::<String>::new());
+}
+
+/// Whatever the layout: after `route` hardly any two connections lie on one line. (That every
+/// route still joins its cards, at right angles and through no card, is checked above.)
+#[test]
+fn connections_rarely_share_a_line() {
+    let mut random = Random(20261125);
+    let (mut routes, mut shared) = (0, 0);
+    for round in 0..600 {
+        let gap = if round % 2 == 0 { 60.0 } else { 20.0 };
+        let mut places: Vec<(f64, f64)> = Vec::new();
+        let wanted = 3 + random.below(8) as usize;
+        let mut tries = 0;
+        while places.len() < wanted && tries < 400 {
+            tries += 1;
+            let place = (20.0 * random.below(70) as f64, 20.0 * random.below(45) as f64);
+            if places.iter().all(|other| (place.0 - other.0).abs() >= 220.0 + gap || (place.1 - other.1).abs() >= 120.0 + gap) {
+                places.push(place);
+            }
+        }
+        let cards: Vec<Value> = places.iter().enumerate().map(|(n, p)| card(&n.to_string(), p.0, p.1)).collect();
+        let mut wires: Vec<Value> = Vec::new();
+        for _ in 0..random.below(2 * places.len() as u64) {
+            let (from, to) = (random.below(places.len() as u64), random.below(places.len() as u64));
+            if from != to {
+                wires.push(json!({ "from": from.to_string(), "to": to.to_string() }));
+            }
+        }
+        let answer = route(&request(json!({ "cards": cards, "connections": wires }))).unwrap();
+        routes += wires.len();
+        shared += shared_lines(&answer).len();
+    }
+    // Pinned: counted once, 2026-11-24. TALA's routes alone: 346 pairs among these 2818 routes.
+    assert_eq!((routes, shared), (2818, 0));
+}
+
+/// Cards of the usual size at these places, joined as listed, routed.
+fn routed(places: &[(f64, f64)], joined: &[(usize, usize)]) -> tidy_layout::api::RouteResponse {
+    let cards: Vec<Value> = places.iter().enumerate().map(|(n, place)| card(&n.to_string(), place.0, place.1)).collect();
+    let wires: Vec<Value> = joined.iter().map(|(from, to)| json!({ "from": from.to_string(), "to": to.to_string() })).collect();
+    route(&request(json!({ "cards": cards, "connections": wires }))).unwrap()
+}
+
+/// Which routes run through the inside of a card, by their number.
+fn through_cards(places: &[(f64, f64)], answer: &tidy_layout::api::RouteResponse) -> Vec<usize> {
+    let inside = |route: &[Position]| {
+        points(route).windows(2).any(|piece| places.iter().any(|place| runs_inside(piece[0], piece[1], place.0, place.1)))
+    };
+    (0..answer.routes.len()).filter(|route| inside(&answer.routes[*route])).collect()
+}
+
+/// A layout found by search (2026-11-24): moved to its own line, connection 3 would run through
+/// a card. That move is not made, and here the lines still come apart.
+#[test]
+fn a_line_never_moves_into_a_card() {
+    let places = [(860.0, 660.0), (40.0, 620.0), (840.0, 60.0), (680.0, 240.0), (220.0, 300.0), (440.0, 640.0), (700.0, 420.0), (160.0, 60.0), (460.0, 40.0), (980.0, 460.0)];
+    let joined = [(8, 9), (9, 0), (0, 3), (7, 6), (2, 6), (5, 1), (1, 4), (5, 6), (7, 4), (7, 6), (4, 8), (9, 6), (8, 2), (2, 6), (1, 8)];
+    let answer = routed(&places, &joined);
+    assert_eq!(through_cards(&places, &answer), Vec::<usize>::new());
+    assert_eq!(shared_lines(&answer), Vec::<String>::new());
+}
+
+/// A layout found by search: pulled apart once, a line comes to lie on a third. The next round
+/// gives that one its own place too.
+#[test]
+fn a_line_moved_onto_another_is_moved_again() {
+    let places = [(480.0, 560.0), (140.0, 140.0), (540.0, 60.0), (100.0, 560.0), (980.0, 620.0), (620.0, 340.0), (920.0, 40.0), (980.0, 400.0), (240.0, 320.0)];
+    let joined = [(4, 8), (6, 5), (2, 7), (2, 1), (2, 3), (5, 1), (7, 8), (2, 4), (8, 3), (3, 2), (7, 6), (7, 5), (7, 3)];
+    let answer = routed(&places, &joined);
+    assert_eq!(through_cards(&places, &answer), Vec::<usize>::new());
+    assert_eq!(shared_lines(&answer), Vec::<String>::new());
+}
+
+/// A layout found by search: three connections end at one point, with a card close beside
+/// their line. 16 apart, one would run through that card: so they come 8 apart.
+#[test]
+fn lines_beside_a_card_come_closer_together() {
+    let places = [(920.0, 520.0), (880.0, 360.0), (180.0, 580.0), (300.0, 320.0), (40.0, 20.0), (400.0, 80.0), (620.0, 460.0), (860.0, 140.0), (40.0, 320.0), (680.0, 680.0)];
+    let joined = [
+        (4, 1), (4, 6), (2, 0), (5, 9), (2, 4), (8, 9), (2, 0), (1, 5), (4, 0), (5, 8), (8, 2), (5, 2), (7, 5), (9, 7),
+        (4, 0), (0, 5), (3, 4), (3, 0), (1, 5), (0, 4), (2, 6), (2, 3), (7, 5), (3, 9), (7, 9), (9, 3), (9, 3),
+    ];
+    let answer = routed(&places, &joined);
+    assert_eq!(through_cards(&places, &answer), Vec::<usize>::new());
+    assert_eq!(shared_lines(&answer), Vec::<String>::new());
+    // They ended at (850, 680), with a card from x = 620 to 840 just beside the line.
+    let ends: Vec<(f64, f64)> = [3, 23, 24].iter().map(|n| *points(&answer.routes[*n]).last().unwrap()).collect();
+    assert_eq!(ends, vec![(850.0, 680.0), (842.0, 680.0), (858.0, 680.0)]);
+}
+
+/// The end of a line stays on the side of its card, 8 from the corners: on a card only 30 wide
+/// two lines have 14 between them, so they come 12 apart, not 16.
+#[test]
+fn the_ends_of_lines_stay_on_the_side_of_a_narrow_card() {
+    let answer = route(&request(json!({
+        "cards": [
+            { "id": "a", "x": 355.0, "y": 0.0, "width": 30, "height": 120 },
+            card("b", 1000.0, 220.0),
+            card("c", 900.0, 620.0),
+        ],
+        "connections": [{ "from": "a", "to": "b" }, { "from": "a", "to": "c" }],
+    })))
+    .unwrap();
+    let starts: Vec<(f64, f64)> = answer.routes.iter().map(|route| (route[0].x, route[0].y)).collect();
+    assert_eq!(starts, vec![(376.0, 120.0), (364.0, 120.0)]);
+    assert_eq!(shared_lines(&answer), Vec::<String>::new());
 }
