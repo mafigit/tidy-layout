@@ -1,0 +1,563 @@
+package placement
+
+// Reference cases for the Rust port tidy-layout.
+// Not part of TALA: it only calls TALA's own functions and records what they answer.
+//
+// One pass of the sized optimizer over all cards (sizedOptimizer.optimize), with the random
+// numbers it drew, and its parts for every card on their own: the point the card is drawn to
+// (medianPointGuarded), the card it would swap places with (bestSwapCandidateGuarded) and the
+// turn of a branch around a card (transpose).
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"sort"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/limits"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/proximity"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+// tape hands out the numbers of Go's generator and keeps what it handed out.
+type tape struct {
+	source rand.Source
+	drawn  []int64
+}
+
+func (t *tape) Int63() int64 {
+	v := t.source.Int63()
+	t.drawn = append(t.drawn, v)
+	return v
+}
+
+func (t *tape) Seed(seed int64) { t.source.Seed(seed) }
+
+// take returns how many numbers were drawn since the last call.
+func (t *tape) take() int {
+	drawn := len(t.drawn)
+	t.drawn = nil
+	return drawn
+}
+
+type passInput struct {
+	Name string `json:"name"`
+	// 0: the cell size TALA computes from the card sizes.
+	CellSize float64 `json:"cellSize"`
+	// x, y, width, height
+	Nodes [][4]float64 `json:"nodes"`
+	// from, to (index into nodes), and the room the label needs (0, 0 without a label)
+	Edges [][4]int `json:"edges"`
+	Temp  float64  `json:"temp"`
+	// The seed of Go's random numbers (math/rand). One generator serves the whole case: the
+	// medians, then the swaps, then the pass.
+	Seed int64 `json:"seed"`
+	// Halve the price of a bend, as node placement does before the sized optimizer runs.
+	Halve bool `json:"halve"`
+}
+
+type medianRecord struct {
+	Point [2]float64 `json:"point"`
+	// How many random numbers it took.
+	Drawn int `json:"drawn"`
+}
+
+type swapRecord struct {
+	// The card to swap with, -1 for none.
+	With  int `json:"with"`
+	Drawn int `json:"drawn"`
+}
+
+type passCase struct {
+	passInput
+	Cell     float64 `json:"cell"`
+	TurnCost float64 `json:"turnCost"`
+	// Per card: its spokes, if it is a hub.
+	Hubs [][]int `json:"hubs"`
+	// Per card with a connection: the point it is drawn to at the case's temperature.
+	Medians []*medianRecord `json:"medians"`
+	Swaps   []swapRecord    `json:"swaps"`
+	// Per card: where all cards are after transpose turned something around it; null when it
+	// turned nothing.
+	Transposes [][][2]float64 `json:"transposes"`
+	// The pass itself.
+	Changed bool         `json:"changed"`
+	After   [][2]float64 `json:"after"`
+	Drawn   int          `json:"drawn"`
+}
+
+func passOf(t *testing.T, in passInput) passCase {
+	ctx := context.Background()
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(in.Nodes))
+	for i, n := range in.Nodes {
+		node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(i+1), n[2], n[3]))
+		node.TopLeft = geo.NewPoint(n[0], n[1])
+		nodes = append(nodes, node)
+	}
+	index := make(map[*layoutgraph.Node]int, len(nodes))
+	for i, node := range nodes {
+		index[node] = i
+	}
+	for _, e := range in.Edges {
+		edge := g.Connect(nodes[e[0]], nodes[e[1]])
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		if e[2] > 0 || e[3] > 0 {
+			edge.MinWidth, edge.MinHeight = e[2], e[3]
+			edge.Label = &layoutgraph.Label{Text: "label", Width: float64(e[2]), Height: float64(e[3])}
+		}
+	}
+	g.ComputeCellSize()
+	if in.CellSize != 0 {
+		g.CellSize = in.CellSize
+	}
+	if err := proximity.AddHubs(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	g.TurnCost()
+	if in.Halve {
+		g.HalveTurnCost()
+	}
+	c := passCase{passInput: in, Cell: g.CellSize, TurnCost: g.TurnCost()}
+	for _, node := range nodes {
+		spokes := []int{}
+		for _, spoke := range g.Hubs[node] {
+			spokes = append(spokes, index[spoke])
+		}
+		if _, is := g.Hubs[node]; !is {
+			spokes = nil
+		}
+		c.Hubs = append(c.Hubs, spokes)
+	}
+
+	numbers := &tape{source: rand.NewSource(in.Seed)}
+	// As node placement calls it for cards in no container: an empty list, not nil.
+	abductions := []*layoutgraph.EdgeAbduction{}
+	optim, err := newSizedOptimizer(ctx, g, nil, abductions, rand.New(numbers), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	guard, err := limits.NewOptimizationWorkGuard(ctx, "LocalOptimize", limits.MaxOptimizationWorkUnits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	places := func() [][2]float64 {
+		at := make([][2]float64, len(nodes))
+		for i, node := range nodes {
+			at[i] = [2]float64{node.TopLeft.X, node.TopLeft.Y}
+		}
+		return at
+	}
+	before := places()
+	restore := func() {
+		for i, node := range nodes {
+			if err := optimizerMoveNodeAbs(node, before[i][0], before[i][1], guard); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	same := func(a, b [][2]float64) bool {
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+
+	for _, node := range nodes {
+		if len(node.Edges) == 0 {
+			c.Medians = append(c.Medians, nil)
+			continue
+		}
+		median, err := optim.medianPointGuarded(node, in.Temp, nil, guard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		c.Medians = append(c.Medians, &medianRecord{Point: [2]float64{median.X, median.Y}, Drawn: numbers.take()})
+	}
+	for _, node := range nodes {
+		if err := optim.rebuildSpatialIndex(guard); err != nil {
+			t.Fatal(err)
+		}
+		candidate, err := optim.bestSwapCandidateGuarded(ctx, node, guard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		with := -1
+		if candidate != nil {
+			with = index[candidate]
+		}
+		c.Swaps = append(c.Swaps, swapRecord{With: with, Drawn: numbers.take()})
+		if !same(before, places()) {
+			t.Fatalf("looking for a swap moved a card")
+		}
+	}
+	for _, node := range nodes {
+		ok, err := transpose(ctx, g, node, abductions)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if ok {
+			c.Transposes = append(c.Transposes, places())
+		} else {
+			if !same(before, places()) {
+				t.Fatalf("a transpose that did nothing moved a card")
+			}
+			c.Transposes = append(c.Transposes, nil)
+		}
+		restore()
+	}
+	if c.TurnCost != g.TurnCost() {
+		t.Fatalf("the turn cost changed before the pass")
+	}
+	if numbers.take() != 0 {
+		t.Fatalf("transpose drew random numbers")
+	}
+
+	changed, err := optim.optimize(ctx, in.Temp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Changed, c.After, c.Drawn = changed, places(), numbers.take()
+	if c.TurnCost != g.TurnCost() {
+		t.Fatalf("the turn cost changed during the pass")
+	}
+	return c
+}
+
+// cellOf is the cell size TALA computes for cards of these sizes.
+func cellOf(sizes [][2]float64) float64 {
+	g := layoutgraph.NewGraph()
+	for i, size := range sizes {
+		node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(i+1), size[0], size[1]))
+		node.TopLeft = geo.NewPoint(0, 0)
+	}
+	g.ComputeCellSize()
+	return g.CellSize
+}
+
+// passCards makes a layout as the sized optimizer meets it: cards on the grid of the cell size,
+// most of them clear of each other, connected as a tree, a chain, a star or at random.
+func passCards(r *rand.Rand) passInput {
+	in := passInput{Edges: [][4]int{}, Seed: 1 + r.Int63n(1_000_000)}
+	count := 2 + r.Intn(11)
+	uniform := r.Intn(3) > 0
+	sizes := make([][2]float64, count)
+	widest, highest := 0.0, 0.0
+	for n := range sizes {
+		sizes[n] = [2]float64{220, 120}
+		if !uniform {
+			sizes[n] = [2]float64{float64(60 + 20*r.Intn(14)), float64(60 + 20*r.Intn(8))}
+		}
+		widest, highest = max(widest, sizes[n][0]), max(highest, sizes[n][1])
+	}
+	// Now and then sizes in odd pixels: the middle of such a card lies between two pixels.
+	if r.Intn(5) == 0 {
+		for n := range sizes {
+			sizes[n][0] += float64(r.Intn(4))
+			sizes[n][1] += float64(r.Intn(4))
+			widest, highest = max(widest, sizes[n][0]), max(highest, sizes[n][1])
+		}
+	}
+	cell := cellOf(sizes)
+	switch r.Intn(4) {
+	case 0:
+		in.CellSize = 20
+		cell = 20
+	case 1:
+		in.CellSize = float64(40 * (1 + r.Intn(5)))
+		cell = in.CellSize
+	}
+	// Now and then a giant: more than 100 cells wide or high. The optimizer leaves it alone.
+	if in.CellSize != 0 && r.Intn(25) == 0 {
+		// A card of exactly 100 cells is none.
+		giant := r.Intn(count)
+		length := 100*cell + float64(20*r.Intn(2))
+		if r.Intn(2) == 0 {
+			sizes[giant][0] = length
+		} else {
+			sizes[giant][1] = length
+		}
+		widest, highest = max(widest, sizes[giant][0]), max(highest, sizes[giant][1])
+	}
+	// Spots far enough apart for the largest card and a gap, some closer.
+	room := 20 + float64(20*r.Intn(5))
+	stepX := float64(int((widest+room)/cell)+1) * cell
+	stepY := float64(int((highest+room)/cell)+1) * cell
+	side := 1 + r.Intn(5)
+	if side*side < count {
+		side = 2
+		for side*side < count {
+			side++
+		}
+		side += r.Intn(2)
+	}
+	spots := r.Perm(side * side)
+	loose := r.Intn(4) == 0
+	for n := 0; n < count; n++ {
+		x, y := stepX*float64(spots[n]%side), stepY*float64(spots[n]/side)
+		if loose || r.Intn(6) == 0 {
+			x += cell * float64(r.Intn(5)-2)
+			y += cell * float64(r.Intn(5)-2)
+		}
+		in.Nodes = append(in.Nodes, [4]float64{x, y, sizes[n][0], sizes[n][1]})
+	}
+	connect := func(a, b int) {
+		edge := [4]int{a, b, 0, 0}
+		if r.Intn(2) == 0 {
+			edge[0], edge[1] = b, a
+		}
+		if r.Intn(4) == 0 {
+			edge[2], edge[3] = 30+r.Intn(200), 20+r.Intn(30)
+		}
+		in.Edges = append(in.Edges, edge)
+		// Now and then several connections between the same two cards.
+		if r.Intn(10) == 0 {
+			for k := 0; k < 1+r.Intn(3); k++ {
+				more := edge
+				if r.Intn(2) == 0 {
+					more[2], more[3] = 30+r.Intn(200), 20+r.Intn(30)
+				}
+				in.Edges = append(in.Edges, more)
+			}
+		}
+	}
+	switch r.Intn(4) {
+	case 0:
+		in.Name = "tree"
+		for n := 1; n < count; n++ {
+			connect(r.Intn(n), n)
+		}
+	case 1:
+		in.Name = "chain"
+		for n := 1; n < count; n++ {
+			if r.Intn(8) > 0 {
+				connect(n-1, n)
+			}
+		}
+	case 2:
+		in.Name = "stars"
+		centres := 1 + r.Intn(2)
+		for n := centres; n < count; n++ {
+			connect(r.Intn(centres), n)
+		}
+		if centres > 1 {
+			connect(0, 1)
+		}
+	default:
+		in.Name = "any"
+		for e := 0; e < 1+r.Intn(count*2); e++ {
+			a, b := r.Intn(count), r.Intn(count)
+			if a != b {
+				connect(a, b)
+			}
+		}
+	}
+	// A few more connections make rings.
+	if r.Intn(3) == 0 {
+		a, b := r.Intn(count), r.Intn(count)
+		if a != b {
+			connect(a, b)
+		}
+	}
+	if r.Intn(2) == 0 {
+		// Hot: the cards are drawn to a point a few card sizes off.
+		in.Temp = 0.2 + 3*r.Float64()
+	}
+	in.Halve = r.Intn(2) == 0
+	return in
+}
+
+func TestExportPassReference(t *testing.T) {
+	out := os.Getenv("PASS_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set PASS_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(20261123))
+	var cases []passCase
+	for len(cases) < 300 {
+		cases = append(cases, passOf(t, passCards(r)))
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by the probe (docs/reference.md, "Finding cases").
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []passInput
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, in := range extra {
+			in.Name = "found"
+			cases = append(cases, passOf(t, in))
+		}
+	}
+	changed, swaps, turns, hubs, draws := 0, 0, 0, 0, 0
+	for _, c := range cases {
+		if c.Changed {
+			changed++
+		}
+		for i := range c.Swaps {
+			if c.Swaps[i].With >= 0 {
+				swaps++
+			}
+			if c.Transposes[i] != nil {
+				turns++
+			}
+			if c.Hubs[i] != nil {
+				hubs++
+			}
+		}
+		draws += c.Drawn
+	}
+	t.Logf("%d cases: %d changed, %d swaps, %d transposes, %d hubs, %d numbers drawn", len(cases), changed, swaps, turns, hubs, draws)
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPassProbe answers layouts made elsewhere: PROBE_IN holds a list of inputs, PROBE_OUT gets
+// TALA's answers in the same order.
+func TestPassProbe(t *testing.T) {
+	in, out := os.Getenv("PROBE_IN"), os.Getenv("PROBE_OUT")
+	if in == "" || out == "" {
+		t.Skip("set PROBE_IN and PROBE_OUT")
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inputs []passInput
+	if err := json.Unmarshal(data, &inputs); err != nil {
+		t.Fatal(err)
+	}
+	answers := make([]passCase, 0, len(inputs))
+	for _, input := range inputs {
+		answers = append(answers, passOf(t, input))
+	}
+	result, err := json.Marshal(answers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type randomCase struct {
+	Seed int64 `json:"seed"`
+	// The first numbers of the generator, and the 700th to 704th: past its 607 slots.
+	First []int64 `json:"first"`
+	Later []int64 `json:"later"`
+	// From a fresh generator with the same seed, in this order: three Float64, three Uint32,
+	// then the numbers 0 to 11 shuffled as TALA shuffles (limits.Shuffle).
+	Floats   []float64 `json:"floats"`
+	Uint32s  []uint32  `json:"uint32s"`
+	Shuffled []int     `json:"shuffled"`
+}
+
+// TestExportRandomReference records Go's random numbers (math/rand, seeded) as TALA uses them.
+func TestExportRandomReference(t *testing.T) {
+	out := os.Getenv("RANDOM_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set RANDOM_REFERENCE_OUT to write the reference cases")
+	}
+	guard, err := limits.NewOptimizationWorkGuard(context.Background(), "LocalOptimize", limits.MaxOptimizationWorkUnits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []randomCase
+	for _, seed := range []int64{1, 0, -5, 42, 20261123, 1<<31 - 1, 1 << 31, 1<<40 + 7, -(1 << 62), 89482311} {
+		c := randomCase{Seed: seed}
+		source := rand.NewSource(seed)
+		for i := 0; i < 704; i++ {
+			v := source.Int63()
+			if i < 5 {
+				c.First = append(c.First, v)
+			}
+			if i >= 699 {
+				c.Later = append(c.Later, v)
+			}
+		}
+		r := rand.New(rand.NewSource(seed))
+		for i := 0; i < 3; i++ {
+			c.Floats = append(c.Floats, r.Float64())
+		}
+		for i := 0; i < 3; i++ {
+			c.Uint32s = append(c.Uint32s, r.Uint32())
+		}
+		c.Shuffled = []int{0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11}
+		if err := limits.Shuffle(c.Shuffled, r, guard); err != nil {
+			t.Fatal(err)
+		}
+		cases = append(cases, c)
+	}
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type sortCase struct {
+	// The keys to sort by, smallest first.
+	Keys []int `json:"keys"`
+	// The places in keys, in the order sort.Slice leaves them.
+	Sorted []int `json:"sorted"`
+}
+
+// TestExportSortReference records Go's sort.Slice, which TALA sorts with: where keys are equal,
+// the order it leaves them in.
+func TestExportSortReference(t *testing.T) {
+	out := os.Getenv("SORT_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set SORT_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(20261126))
+	var cases []sortCase
+	for _, length := range []int{0, 1, 2, 12, 13, 14, 20, 33, 49, 50, 51, 64, 100, 257, 700} {
+		for kind := 0; kind < 6; kind++ {
+			keys := make([]int, length)
+			for i := range keys {
+				switch kind {
+				case 0:
+					keys[i] = r.Intn(3)
+				case 1:
+					keys[i] = r.Intn(length + 1)
+				case 2:
+					keys[i] = i / 3
+				case 3:
+					keys[i] = (length - i) / 2
+				case 4:
+					keys[i] = 7
+				default:
+					keys[i] = (i * 7919) % 11
+				}
+			}
+			sorted := make([]int, length)
+			for i := range sorted {
+				sorted[i] = i
+			}
+			sort.Slice(sorted, func(i, j int) bool { return keys[sorted[i]] < keys[sorted[j]] })
+			cases = append(cases, sortCase{Keys: keys, Sorted: sorted})
+		}
+	}
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

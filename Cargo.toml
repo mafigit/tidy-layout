@@ -1,0 +1,29 @@
+[package]
+name = "tidy-layout"
+version = "0.1.0"
+edition = "2024"
+license = "MPL-2.0"
+description = "A layout engine for diagrams of cards and connections: a Rust port of parts of TALA, the layout engine of D2"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[dev-dependencies]
+# The reference tests compare prices bit for bit, so numbers in fixtures must be read exactly.
+serde_json = { version = "1", features = ["float_roundtrip"] }
+
+# The reference tests replay millions of TALA's steps; unoptimized they take a minute.
+[profile.test]
+opt-level = 1
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

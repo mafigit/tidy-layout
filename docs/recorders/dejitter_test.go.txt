@@ -1,0 +1,212 @@
+package engine
+
+// Reference cases for the Rust port tidy-layout: what TALA's
+// Dejitter does to cards and routes. Not part of TALA: it only calls TALA's own functions and
+// records what they answer.
+//
+// The pipeline runs the stage after the first routing. It moves a card in one diagram of plain
+// cards in 1,800. Here the layouts are made for it: cards in rows and columns, most of them a
+// little out of line, routed by TALA's RouteGraph.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"reflect"
+	"strconv"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/placement"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/routing"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type dejitterCase struct {
+	// x, y, width, height
+	Cards [][4]float64 `json:"cards"`
+	// from, to (index into cards)
+	Links [][2]int `json:"links"`
+	// Per link its route after the first routing.
+	Routes [][][2]float64 `json:"routes"`
+	// What the stage says: a card moved, so the connections must be routed again.
+	Moved bool `json:"moved"`
+	// The places of the cards and the routes after the stage.
+	CardsAfter  [][2]float64   `json:"cardsAfter"`
+	RoutesAfter [][][2]float64 `json:"routesAfter"`
+}
+
+func dejitterApart(cards [][4]float64, k [4]float64) bool {
+	for _, o := range cards {
+		if k[0] < o[0]+o[2]+60 && o[0] < k[0]+k[2]+60 && k[1] < o[1]+o[3]+60 && o[1] < k[1]+k[3]+60 {
+			return false
+		}
+	}
+	return true
+}
+
+func dejitterCards(r *rand.Rand) dejitterCase {
+	c := dejitterCase{}
+	cols, rows := 2+r.Intn(3), 1+r.Intn(3)
+	gapX, gapY := float64(80+20*r.Intn(7)), float64(80+20*r.Intn(7))
+	cell := map[[2]int]int{}
+	for row := 0; row < rows; row++ {
+		for col := 0; col < cols; col++ {
+			if r.Intn(6) == 0 {
+				continue
+			}
+			size := [2]float64{220, 120}
+			switch r.Intn(8) {
+			case 0:
+				size = [2]float64{160, 80}
+			case 1:
+				size = [2]float64{120, 120}
+			}
+			k := [4]float64{1000 + float64(col)*(220+gapX), 1000 + float64(row)*(120+gapY), size[0], size[1]}
+			// Most cards are a little out of line.
+			if r.Intn(5) > 0 {
+				k[0] += float64(5 * (r.Intn(17) - 8))
+			}
+			if r.Intn(5) > 0 {
+				k[1] += float64(5 * (r.Intn(17) - 8))
+			}
+			if dejitterApart(c.Cards, k) {
+				cell[[2]int{row, col}] = len(c.Cards)
+				c.Cards = append(c.Cards, k)
+			}
+		}
+	}
+	link := func(a, b int) {
+		if r.Intn(2) == 0 {
+			a, b = b, a
+		}
+		c.Links = append(c.Links, [2]int{a, b})
+	}
+	for row := 0; row < rows; row++ {
+		for col := 0; col < cols; col++ {
+			a, has := cell[[2]int{row, col}]
+			if !has {
+				continue
+			}
+			if b, has := cell[[2]int{row, col + 1}]; has && r.Intn(5) < 3 {
+				link(a, b)
+			}
+			if b, has := cell[[2]int{row + 1, col}]; has && r.Intn(5) < 3 {
+				link(a, b)
+			}
+		}
+	}
+	for n := r.Intn(3); n > 0 && len(c.Cards) > 1; n-- {
+		a, b := r.Intn(len(c.Cards)), r.Intn(len(c.Cards))
+		if a != b {
+			link(a, b)
+		}
+	}
+	return c
+}
+
+func dejitterOf(t *testing.T, c *dejitterCase) {
+	ctx := context.Background()
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(c.Cards))
+	for i, k := range c.Cards {
+		node := layoutgraph.NewNode(layoutgraph.EntityID(i+1), k[2], k[3])
+		g.AddNewNodeToContainer(nil, node)
+		node.TopLeft = geo.NewPoint(k[0], k[1])
+		nodes = append(nodes, node)
+	}
+	edges := make([]*layoutgraph.Edge, 0, len(c.Links))
+	for _, l := range c.Links {
+		edge := g.Connect(nodes[l[0]], nodes[l[1]])
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		edges = append(edges, edge)
+	}
+	g.ComputeCellSize()
+	if _, err := routing.RouteGraph(ctx, g, routing.GraphRouteOptions{}); err != nil {
+		t.Fatal(err)
+	}
+	routes := func() [][][2]float64 {
+		all := [][][2]float64{}
+		for _, edge := range edges {
+			route := [][2]float64{}
+			for _, p := range edge.Points {
+				route = append(route, [2]float64{p.X, p.Y})
+			}
+			all = append(all, route)
+		}
+		return all
+	}
+	c.Routes = routes()
+	moved, err := placement.Dejitter(ctx, g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Moved = moved
+	c.CardsAfter = [][2]float64{}
+	for _, node := range nodes {
+		c.CardsAfter = append(c.CardsAfter, [2]float64{node.TopLeft.X, node.TopLeft.Y})
+	}
+	c.RoutesAfter = routes()
+}
+
+func TestExportDejitterReference(t *testing.T) {
+	out := os.Getenv("DEJITTER_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set DEJITTER_REFERENCE_OUT to write the reference cases")
+	}
+	// DEJITTER_SEED and DEJITTER_COUNT make another set, for `probe_dejitter compare`.
+	seed, count := int64(2026112402), 400
+	if value, err := strconv.ParseInt(os.Getenv("DEJITTER_SEED"), 10, 64); err == nil {
+		seed = value
+	}
+	if value, err := strconv.Atoi(os.Getenv("DEJITTER_COUNT")); err == nil {
+		count = value
+	}
+	r := rand.New(rand.NewSource(seed))
+	var cases []dejitterCase
+	// Half of the cases are layouts in which the stage moves a card: of those it leaves alone,
+	// only so many are kept.
+	made, changed, unchanged := 0, 0, 0
+	for len(cases) < count {
+		c := dejitterCards(r)
+		if len(c.Links) == 0 {
+			continue
+		}
+		made++
+		dejitterOf(t, &c)
+		if c.Moved != !reflect.DeepEqual(c.Routes, c.RoutesAfter) {
+			t.Fatalf("the stage says %v, but the routes say otherwise", c.Moved)
+		}
+		if c.Moved {
+			changed++
+		} else if unchanged++; unchanged > count/2 {
+			continue
+		}
+		cases = append(cases, c)
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by the probe (docs/reference.md, "Finding cases").
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []dejitterCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			c := dejitterCase{Cards: c.Cards, Links: c.Links}
+			dejitterOf(t, &c)
+			cases = append(cases, c)
+		}
+	}
+	t.Logf("%d cases of %d layouts, the stage moves a card in %d", len(cases), made, changed)
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

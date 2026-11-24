@@ -1,0 +1,163 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout: the routes
+// TALA finds for all connections of a layout, in each of its three orders, and the ones it keeps.
+// Not part of TALA: it only calls TALA's own functions and records what they answer.
+// Uses the helpers of reference_ovg_export_test.go and reference_search_export_test.go.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"math/rand"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+// flavorRoute is one route of a flavor: its link, how many points of the graph it passes and a
+// hash of all of them ("x,y x,y ..." in quarters, FNV-1a 64 bit).
+type flavorRoute struct {
+	Link   int    `json:"link"`
+	Points int    `json:"points"`
+	Hash   string `json:"hash"`
+}
+
+type flavorRoutes struct {
+	Flavor string `json:"flavor"`
+	// Distance: the sum of the routes' prices.
+	Distance float64 `json:"distance"`
+	// Routes: in the order this flavor routed the connections.
+	Routes []flavorRoute `json:"routes"`
+}
+
+type routesCase struct {
+	Kind    string         `json:"kind"`
+	Cards   []ovgCard      `json:"cards"`
+	Links   [][2]int       `json:"links"`
+	Flavors []flavorRoutes `json:"flavors"`
+	// Kept: per link, the ports and bends of the route TALA keeps, in quarters.
+	Kept [][][2]int64 `json:"kept"`
+}
+
+func routesGraph(cards []ovgCard, wanted [][2]int) (*layoutgraph.Graph, []*layoutgraph.Edge, [][2]int) {
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(cards))
+	for n, card := range cards {
+		node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), card.Width, card.Height))
+		node.TopLeft = geo.NewPoint(card.X, card.Y)
+		nodes = append(nodes, node)
+	}
+	var edges []*layoutgraph.Edge
+	links := [][2]int{}
+	for _, link := range wanted {
+		if searchQuick(nodes[link[0]], nodes[link[1]]) {
+			continue
+		}
+		edge := g.Connect(nodes[link[0]], nodes[link[1]])
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		edges = append(edges, edge)
+		links = append(links, link)
+	}
+	return g, edges, links
+}
+
+func describeRoute(t *testing.T, link int, found []*OVGNode) flavorRoute {
+	var all []string
+	for _, node := range found {
+		all = append(all, fmt.Sprintf("%d,%d", q(t, node.X), q(t, node.Y)))
+	}
+	h := fnv.New64a()
+	h.Write([]byte(strings.Join(all, " ")))
+	return flavorRoute{Link: link, Points: len(found), Hash: fmt.Sprintf("%016x", h.Sum64())}
+}
+
+func routesOf(t *testing.T, kind string, cards []ovgCard, wanted [][2]int) routesCase {
+	ctx := context.Background()
+	c := routesCase{Kind: kind, Cards: cards, Flavors: []flavorRoutes{}, Kept: [][][2]int64{}}
+	g, edges, links := routesGraph(cards, wanted)
+	c.Links = links
+	if len(edges) == 0 {
+		return c
+	}
+	g.ComputeCellSize()
+	ovg, err := buildOVGFromGraphWithLimits(ctx, g, nil, defaultOVGBuildLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.CrossingCost()
+	g.TurnCost()
+	g.NonCenterPortCost()
+	index := map[*layoutgraph.Edge]int{}
+	for i, edge := range edges {
+		index[edge] = i
+	}
+	for _, flavor := range []RouteGenerationFlavor{ShortestToLongest, LongestToShortest, Default} {
+		router, err := newOVGEdgeRouterWithWorkLimit(ctx, flavor, ovg, g, nil, edges, maxRouteSearchWorkUnits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router.considerNodeLabels = true
+		response := router.generateRoutes(ctx, true)
+		if response.Err != nil {
+			t.Fatalf("%s: %v", flavor, response.Err)
+		}
+		f := flavorRoutes{Flavor: string(flavor), Distance: response.Distance}
+		for _, route := range response.Routes {
+			f.Routes = append(f.Routes, describeRoute(t, index[route.GEdge], route.OVGNodes))
+		}
+		c.Flavors = append(c.Flavors, f)
+	}
+	// And the whole step as TALA runs it, on a graph of its own.
+	g, edges, _ = routesGraph(cards, wanted)
+	g.ComputeCellSize()
+	if _, err := routeAdditionalEdgesWithLimits(ctx, g, edges, defaultOVGBuildLimits()); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range edges {
+		kept := [][2]int64{}
+		for _, p := range edge.Points {
+			kept = append(kept, [2]int64{q(t, p.X), q(t, p.Y)})
+		}
+		c.Kept = append(c.Kept, kept)
+	}
+	return c
+}
+
+func TestExportRoutesReference(t *testing.T) {
+	out := os.Getenv("ROUTES_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set ROUTES_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(2026112106))
+	var cases []routesCase
+	for i := 0; i < 240; i++ {
+		kind, cards, wanted := searchCards(r, i)
+		cases = append(cases, routesOf(t, kind, cards, wanted))
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by probe_search (docs/reference.md, "Finding cases").
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []probeCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			cases = append(cases, routesOf(t, "found", c.Cards, c.Links))
+		}
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

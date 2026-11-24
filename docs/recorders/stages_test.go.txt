@@ -1,0 +1,650 @@
+package engine
+
+// Reference cases for the Rust port tidy-layout.
+// Not part of TALA: it only runs TALA's own pipeline and records what it does.
+//
+// The stages of the pipeline up to the end of placement, one by one, for plain cards: which
+// structures the first stages find (trees, hierarchies, clusters, sequences), where the cards
+// are after node placement, and after every later stage that moves them.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/rand"
+	"os"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/quality"
+)
+
+type stagesInput struct {
+	Name string `json:"name"`
+	// width, height
+	Nodes [][2]float64 `json:"nodes"`
+	// from, to (index into nodes), and the room the label needs (0, 0 without a label)
+	Edges [][4]int `json:"edges"`
+	Seed  int64    `json:"seed"`
+}
+
+// A stage that moved a card: its name, its number in the pipeline's plan (the stage that
+// lines cards up runs four times under one name) and where the cards are after it.
+type stageRecord struct {
+	Stage string       `json:"stage"`
+	Index int          `json:"index"`
+	At    [][2]float64 `json:"at"`
+}
+
+// A cluster: the number of its vessel (the card that stands for it while cards are placed),
+// its cards in order, "Row" or "Column", the padding between its cards, and the vessel's place
+// (0, 0 before it has one) and size.
+type clusterRecord struct {
+	Vessel      int64      `json:"vessel"`
+	Nodes       []int      `json:"nodes"`
+	Arrangement string     `json:"arrangement"`
+	Padding     float64    `json:"padding"`
+	At          [2]float64 `json:"at"`
+	Size        [2]float64 `json:"size"`
+}
+
+type stagesCase struct {
+	stagesInput
+	// What the stages before node placement found.
+	Trees       bool `json:"trees"`
+	Hierarchies bool `json:"hierarchies"`
+	Clusters    bool `json:"clusters"`
+	Sequences   bool `json:"sequences"`
+	// After the tree stage: the cards and connections left in the graph, in its order, and the
+	// trees taken out of it. A tree is [card, from, to, children...]: the card, the connection
+	// that joins it to its parent (or, for a root, to the card the tree hangs on), and its
+	// children as trees.
+	TreeOrder []int            `json:"treeOrder"`
+	TreeEdges [][2]int         `json:"treeEdges"`
+	TreeRoots map[string][]any `json:"treeRoots"`
+	// After the hierarchy stage: the level of each card in its hierarchy (-1: in none), and the
+	// places the stage gave the cards (0, 0 for a card in no hierarchy).
+	Levels          []int        `json:"levels"`
+	HierarchyPlaced [][2]float64 `json:"hierarchyPlaced"`
+	// After the cluster stage: the clusters in the order they were made, and the size of every
+	// card (the cards of a cluster all get its largest width and height).
+	ClusterList  []clusterRecord `json:"clusterList"`
+	ClusterSizes [][2]float64    `json:"clusterSizes"`
+	// The graph as node placement meets it. The stages before it may change the order of cards
+	// and connections (the tree stage takes cards out and puts them back) and make cards with
+	// many connections larger: the cards by their index in nodes, their sizes in that order,
+	// and the connections as [from, to] by index in nodes.
+	Order      []int        `json:"order"`
+	Sizes      [][2]float64 `json:"sizes"`
+	EdgesAfter [][2]int     `json:"edgesAfter"`
+	// After node placement.
+	Cell   float64      `json:"cell"`
+	Placed [][2]float64 `json:"placed"`
+	// The clusters and the size of every card after node placement: a cluster may have turned
+	// from a row into a column or back.
+	ClustersPlaced []clusterRecord `json:"clustersPlaced"`
+	PlacedSizes    [][2]float64    `json:"placedSizes"`
+	// The graph as the stages after node placement meet it: the cards and vessels in its
+	// order (trees are back in it, the groups are packed), and the connections as [from, to].
+	NodesPlaced []int64    `json:"nodesPlaced"`
+	EdgesPlaced [][2]int64 `json:"edgesPlaced"`
+	// The top-level list then (the cards a price asks whether they stand in the way), and per
+	// card of nodesPlaced its own list of connections, as their places in edgesPlaced. Both
+	// can be in another order than the graph's lists once trees are back.
+	TopLevelPlaced []int64 `json:"topLevelPlaced"`
+	OwnEdgesPlaced [][]int `json:"ownEdgesPlaced"`
+	// Every later stage before routing that moved a card, with the places after it.
+	Moved []stageRecord `json:"moved"`
+	// After the last stage (Normalize), with routing done in between.
+	Final [][2]float64 `json:"final"`
+	// Only with STAGES_ROUTED set: every stage from the first routing on that moved a card or
+	// changed a route, and where the labels are at the end.
+	Routed []routedRecord `json:"routed,omitempty"`
+	Labels [][2]float64   `json:"labels,omitempty"`
+	// Also only then: where the labels are right after the stage that places them
+	// (PlaceLabels), before a later stage changes a route or Normalize moves the diagram.
+	LabelsPlaced [][2]float64 `json:"labelsPlaced,omitempty"`
+	// Also only then, before the last stage (Normalize): where the labels are, and what
+	// quality.Inspect counts: cards on each other, routes through cards, covered labels,
+	// crossings, detour, route length.
+	LabelsEnd  [][2]float64 `json:"labelsEnd,omitempty"`
+	MetricsEnd []float64    `json:"metricsEnd,omitempty"`
+	// Also only then, after the last stage: TALA's score of the finished drawing
+	// (quality.EvaluateWithArea), the penalty and the area. Of three seeds the one with the
+	// least penalty, then the least area, wins.
+	Score []float64 `json:"score,omitempty"`
+	// With STAGES_ROUTED and STAGES_SEEDS: the same score for seeds 1, 2 and 3, the seeds
+	// TALA's Layout tries by default.
+	SeedScores [][]float64 `json:"seedScores,omitempty"`
+	// Also only then: the graph's order of cards and of connections when routing starts, as
+	// places in the input.
+	NodeOrderRouted []int `json:"nodeOrderRouted,omitempty"`
+	EdgeOrderRouted []int `json:"edgeOrderRouted,omitempty"`
+	// With STAGES_ROUTED, what TALA knows of the trees when routing starts: per card of a
+	// tree its number, the connection to the card it hangs on (index into edges) and the side
+	// of that card it lies on ("Top", "Right", "Bottom", "Left"); and the connections TALA
+	// takes for tree connections (index into edges).
+	TreesRouted     [][3]any `json:"treesRouted,omitempty"`
+	TreeEdgesRouted []int    `json:"treeEdgesRouted,omitempty"`
+	// Also then, for a diagram with trees: every card's own list of connections (per card in
+	// the order of nodeOrderRouted, as indexes into edges) and the top-level list of cards.
+	OwnEdgesRouted [][]int `json:"ownEdgesRouted,omitempty"`
+	TopLevelRouted []int   `json:"topLevelRouted,omitempty"`
+	// Also then: where the tree stage wants the label of a connection: the connection (index
+	// into edges), the position ("UNLOCKED_TOP", "UNLOCKED_MIDDLE", "UNLOCKED_BOTTOM") and
+	// how far along the route, from 0 to 1.
+	LabelPresetsRouted [][3]any `json:"labelPresetsRouted,omitempty"`
+	// Also then, for a diagram with a hierarchy: per card of one its number, the number of
+	// its hierarchy (counted in the order of the cards) and its level in it.
+	HierarchiesRouted [][3]int `json:"hierarchiesRouted,omitempty"`
+	// Also then, for a diagram with a cluster: per cluster in TALA's order (ClusterOrder) its
+	// cards in its order, its arrangement and the arrangement the cards around it asked for.
+	// ownEdgesRouted and topLevelRouted are written too.
+	ClustersRouted []clusterRouted `json:"clustersRouted,omitempty"`
+}
+
+type clusterRouted struct {
+	Nodes       []int  `json:"nodes"`
+	Arrangement string `json:"arrangement"`
+	Desired     string `json:"desired"`
+}
+
+type routedRecord struct {
+	Stage string `json:"stage"`
+	// The place of the stage in the pipeline: names repeat.
+	Index int `json:"index"`
+	// The places of the cards, if one moved.
+	At [][2]float64 `json:"at,omitempty"`
+	// The routes of the connections, in the order of the input, if one changed.
+	Routes [][][2]float64 `json:"routes,omitempty"`
+}
+
+func stagesOf(t *testing.T, in stagesInput) stagesCase {
+	ctx := context.Background()
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(in.Nodes))
+	for i, n := range in.Nodes {
+		node := layoutgraph.NewNode(layoutgraph.EntityID(i+1), n[0], n[1])
+		g.AddNewNodeToContainer(nil, node)
+		nodes = append(nodes, node)
+	}
+	edges := make([]*layoutgraph.Edge, 0, len(in.Edges))
+	for _, e := range in.Edges {
+		edge := g.Connect(nodes[e[0]], nodes[e[1]])
+		edges = append(edges, edge)
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		if e[2] > 0 || e[3] > 0 {
+			edge.MinWidth, edge.MinHeight = e[2], e[3]
+			edge.Label = &layoutgraph.Label{Text: "label", Width: float64(e[2]), Height: float64(e[3])}
+		}
+	}
+	c := stagesCase{stagesInput: in, Moved: []stageRecord{}}
+	places := func() [][2]float64 {
+		at := make([][2]float64, len(nodes))
+		for i, node := range nodes {
+			if node.TopLeft != nil {
+				at[i] = [2]float64{node.TopLeft.X, node.TopLeft.Y}
+			}
+		}
+		return at
+	}
+	same := func(a, b [][2]float64) bool {
+		for i := range a {
+			if a[i] != b[i] {
+				return false
+			}
+		}
+		return true
+	}
+	sizes := func() [][2]float64 {
+		all := make([][2]float64, len(nodes))
+		for i, node := range nodes {
+			all[i] = [2]float64{node.Width, node.Height}
+		}
+		return all
+	}
+	var vessels []*layoutgraph.Node
+	clusters := func() []clusterRecord {
+		list := []clusterRecord{}
+		for _, vessel := range vessels {
+			cluster := g.Clusters[vessel]
+			record := clusterRecord{Vessel: int64(vessel.ID) - 1, Nodes: []int{}, Arrangement: string(cluster.Arrangement), Padding: cluster.Padding, Size: [2]float64{vessel.Width, vessel.Height}}
+			for _, member := range cluster.Nodes {
+				record.Nodes = append(record.Nodes, int(member.ID)-1)
+			}
+			if vessel.TopLeft != nil {
+				record.At = [2]float64{vessel.TopLeft.X, vessel.TopLeft.Y}
+			}
+			list = append(list, record)
+		}
+		return list
+	}
+	p := newPipeline(g, in.Seed, false)
+	placed := false
+	routed := false
+	var before [][2]float64
+	withRoutes := os.Getenv("STAGES_ROUTED") != ""
+	routes := func() [][][2]float64 {
+		all := make([][][2]float64, len(edges))
+		for i, edge := range edges {
+			all[i] = [][2]float64{}
+			for _, point := range edge.Points {
+				all[i] = append(all[i], [2]float64{point.X, point.Y})
+			}
+		}
+		return all
+	}
+	sameRoutes := func(a, b [][][2]float64) bool {
+		if len(a) != len(b) {
+			return false
+		}
+		for i := range a {
+			if len(a[i]) != len(b[i]) {
+				return false
+			}
+			for j := range a[i] {
+				if a[i][j] != b[i][j] {
+					return false
+				}
+			}
+		}
+		return true
+	}
+	labelPlaces := func() [][2]float64 {
+		all := make([][2]float64, len(edges))
+		for i, edge := range edges {
+			if edge.Label != nil {
+				topLeft := edge.LabelTopLeft(edge.Label.Position, edge.Label.Width, edge.Label.Height)
+				all[i] = [2]float64{topLeft.X, topLeft.Y}
+			}
+		}
+		return all
+	}
+	var lastAt [][2]float64
+	var lastRoutes [][][2]float64
+	for index, stage := range p.stagePlan() {
+		if err := stage.run(p, ctx); err != nil {
+			t.Fatalf("%s: %v", stage.name, err)
+		}
+		switch {
+		case stage.name == "PreprocessTrees":
+			c.TreeEdges = [][2]int{}
+			for _, n := range g.Nodes {
+				c.TreeOrder = append(c.TreeOrder, int(n.ID)-1)
+			}
+			for _, e := range g.Edges {
+				c.TreeEdges = append(c.TreeEdges, [2]int{int(e.From.ID) - 1, int(e.To.ID) - 1})
+			}
+			c.TreeRoots = map[string][]any{}
+			var treeOf func(tree *layoutgraph.Tree) []any
+			treeOf = func(tree *layoutgraph.Tree) []any {
+				out := []any{int(tree.Node.ID) - 1, int(tree.SentinelEdge.From.ID) - 1, int(tree.SentinelEdge.To.ID) - 1}
+				for _, child := range tree.Children {
+					out = append(out, treeOf(child))
+				}
+				return out
+			}
+			for sentinel, roots := range g.Trees {
+				list := []any{}
+				for _, root := range roots {
+					list = append(list, treeOf(root))
+				}
+				c.TreeRoots[fmt.Sprint(int(sentinel.ID)-1)] = list
+			}
+		case stage.name == "PreprocessHierarchies":
+			c.Levels = make([]int, len(nodes))
+			for i, node := range nodes {
+				c.Levels[i] = -1
+				if node.Hierarchy != nil {
+					c.Levels[i] = node.Hierarchy.Levels()[node]
+				}
+			}
+			c.HierarchyPlaced = places()
+		case stage.name == "PreprocessClusters":
+			for _, n := range g.Nodes {
+				if n.IsClusterVessel() {
+					vessels = append(vessels, n)
+				}
+			}
+			if len(vessels) != len(g.Clusters) {
+				t.Fatalf("%d vessels in the graph, %d clusters", len(vessels), len(g.Clusters))
+			}
+			c.ClusterList, c.ClusterSizes = clusters(), sizes()
+		case stage.name == "PreprocessHubs":
+			c.Sequences = len(g.Sequences) > 0
+			c.Clusters = len(g.Clusters) > 0
+			c.Trees = len(g.Trees) > 0 || len(g.NodeToTree) > 0
+			for _, n := range g.Nodes {
+				if n.Hierarchy != nil {
+					c.Hierarchies = true
+				}
+				c.Order = append(c.Order, int(n.ID)-1)
+				c.Sizes = append(c.Sizes, [2]float64{n.Width, n.Height})
+			}
+			// Where the later stages find nothing, they must leave the tree stage's order alone.
+			if !c.Hierarchies && !c.Clusters && !c.Sequences {
+				for i, id := range c.Order {
+					if i >= len(c.TreeOrder) || c.TreeOrder[i] != id {
+						t.Fatalf("a stage after the tree stage changed the order of the cards")
+					}
+				}
+				if len(g.Edges) != len(c.TreeEdges) {
+					t.Fatalf("a stage after the tree stage changed the connections")
+				}
+				for i, e := range g.Edges {
+					if c.TreeEdges[i] != [2]int{int(e.From.ID) - 1, int(e.To.ID) - 1} {
+						t.Fatalf("a stage after the tree stage changed the order of the connections")
+					}
+				}
+			}
+			// The port takes the order of the cards for the order of the top-level list too.
+			for i, n := range g.Containers[nil] {
+				if i >= len(c.Order) || int(n.ID)-1 != c.Order[i] {
+					t.Fatalf("the list of top-level cards is in another order than the cards")
+				}
+			}
+			c.EdgesAfter = [][2]int{}
+			for _, e := range g.Edges {
+				c.EdgesAfter = append(c.EdgesAfter, [2]int{int(e.From.ID) - 1, int(e.To.ID) - 1})
+			}
+			// The port keeps one list of connections; a card's own list must be that list's order.
+			if !c.Trees && !c.Hierarchies && !c.Clusters && !c.Sequences {
+				for _, n := range g.Nodes {
+					at := 0
+					for _, e := range g.Edges {
+						if e.From != n && e.To != n {
+							continue
+						}
+						if at >= len(n.Edges) || n.Edges[at] != e {
+							t.Fatalf("card %d lists its connections in another order than the graph", n.ID-1)
+						}
+						at++
+					}
+					if at != len(n.Edges) {
+						t.Fatalf("card %d lists connections the graph does not have", n.ID-1)
+					}
+				}
+			}
+		case stage.name == "NodePlacement":
+			c.Cell, c.Placed = g.CellSize, places()
+			c.ClustersPlaced, c.PlacedSizes = clusters(), sizes()
+			c.NodesPlaced, c.EdgesPlaced = []int64{}, [][2]int64{}
+			for _, n := range g.Nodes {
+				c.NodesPlaced = append(c.NodesPlaced, int64(n.ID)-1)
+			}
+			for _, e := range g.Edges {
+				c.EdgesPlaced = append(c.EdgesPlaced, [2]int64{int64(e.From.ID) - 1, int64(e.To.ID) - 1})
+			}
+			c.TopLevelPlaced, c.OwnEdgesPlaced = []int64{}, [][]int{}
+			for _, n := range g.Containers[nil] {
+				c.TopLevelPlaced = append(c.TopLevelPlaced, int64(n.ID)-1)
+			}
+			place := map[*layoutgraph.Edge]int{}
+			for i, e := range g.Edges {
+				place[e] = i
+			}
+			for _, n := range g.Nodes {
+				own := []int{}
+				for _, e := range n.Edges {
+					own = append(own, place[e])
+				}
+				c.OwnEdgesPlaced = append(c.OwnEdgesPlaced, own)
+			}
+			before, placed = c.Placed, true
+		case stage.name == "EdgeRouting":
+			routed = true
+		case placed && !routed:
+			if now := places(); !same(now, before) {
+				c.Moved = append(c.Moved, stageRecord{Stage: stage.name, Index: index, At: now})
+				before = now
+			}
+		}
+		if withRoutes && stage.name == "Rescale" {
+			place := map[*layoutgraph.Edge]int{}
+			for i, edge := range edges {
+				place[edge] = i
+			}
+			for _, node := range g.Nodes {
+				c.NodeOrderRouted = append(c.NodeOrderRouted, int(node.ID)-1)
+			}
+			for _, edge := range g.Edges {
+				c.EdgeOrderRouted = append(c.EdgeOrderRouted, place[edge])
+			}
+			for _, node := range g.Nodes {
+				if tree, has := g.NodeToTree[node]; has {
+					at, known := place[tree.SentinelEdge]
+					if !known {
+						t.Fatalf("a tree card's connection is none of the diagram's")
+					}
+					c.TreesRouted = append(c.TreesRouted, [3]any{int(node.ID) - 1, at, tree.Orientation.ToString()})
+				}
+			}
+			for _, vessel := range g.ClusterOrder() {
+				cluster := g.Clusters[vessel]
+				record := clusterRouted{Nodes: []int{}, Arrangement: string(cluster.Arrangement), Desired: string(cluster.DesiredArrangement)}
+				for _, member := range cluster.Nodes {
+					record.Nodes = append(record.Nodes, int(member.ID)-1)
+				}
+				c.ClustersRouted = append(c.ClustersRouted, record)
+			}
+			if len(c.TreesRouted) > 0 || len(c.ClustersRouted) > 0 {
+				for _, node := range g.Nodes {
+					own := []int{}
+					for _, edge := range node.Edges {
+						own = append(own, place[edge])
+					}
+					c.OwnEdgesRouted = append(c.OwnEdgesRouted, own)
+				}
+				for _, node := range g.Containers[nil] {
+					c.TopLevelRouted = append(c.TopLevelRouted, int(node.ID)-1)
+				}
+			}
+			for _, edge := range g.Edges {
+				if edge.Label != nil && (edge.Label.Position.IsUnlocked() || edge.LabelPercentage != 0) {
+					c.LabelPresetsRouted = append(c.LabelPresetsRouted, [3]any{place[edge], edge.Label.Position.String(), edge.LabelPercentage})
+				}
+			}
+			groups := map[*layoutgraph.Hierarchy]int{}
+			for _, node := range g.Nodes {
+				if node.Hierarchy == nil {
+					continue
+				}
+				if _, known := groups[node.Hierarchy]; !known {
+					groups[node.Hierarchy] = len(groups)
+				}
+				c.HierarchiesRouted = append(c.HierarchiesRouted, [3]int{int(node.ID) - 1, groups[node.Hierarchy], node.HierarchyLevel()})
+			}
+			isTreeEdge := g.TreeEdgeMap()
+			g.AddIsolatedTreeEdges(isTreeEdge)
+			for _, edge := range g.Edges {
+				if isTreeEdge[edge] {
+					c.TreeEdgesRouted = append(c.TreeEdgesRouted, place[edge])
+				}
+			}
+		}
+		if withRoutes && stage.name == "PlaceLabels" {
+			c.LabelsPlaced = labelPlaces()
+		}
+		if withRoutes && stage.name == "ShortcutEdgeRoutes" {
+			c.LabelsEnd = labelPlaces()
+			metrics, err := quality.Inspect(ctx, g)
+			if err != nil {
+				t.Fatalf("Inspect: %v", err)
+			}
+			c.MetricsEnd = []float64{float64(metrics.NodeOverlaps), float64(metrics.RouteObstructions), float64(metrics.TextOcclusions), metrics.Crossings, metrics.Detour, metrics.RouteLength}
+		}
+		if withRoutes {
+			at, lines := places(), routes()
+			if routed {
+				record := routedRecord{Stage: stage.name, Index: index}
+				if !same(at, lastAt) {
+					record.At = at
+				}
+				if !sameRoutes(lines, lastRoutes) {
+					record.Routes = lines
+				}
+				if record.At != nil || record.Routes != nil {
+					c.Routed = append(c.Routed, record)
+				}
+			}
+			lastAt, lastRoutes = at, lines
+		}
+	}
+	if withRoutes {
+		c.Labels = labelPlaces()
+		penalty, area, err := quality.EvaluateWithArea(ctx, g)
+		if err != nil {
+			t.Fatalf("EvaluateWithArea: %v", err)
+		}
+		c.Score = []float64{penalty, area}
+	}
+	c.Final = places()
+	return c
+}
+
+// stagesCards makes cards as an architecture diagram has them: one or several groups, as trees,
+// chains or anything, most connections with a label.
+func stagesCards(r *rand.Rand, most int) stagesInput {
+	in := stagesInput{Edges: [][4]int{}, Seed: int64(1 + r.Intn(3))}
+	count := 1 + r.Intn(most)
+	uniform := r.Intn(4) > 0
+	for n := 0; n < count; n++ {
+		size := [2]float64{220, 120}
+		if !uniform {
+			size = [2]float64{float64(60 + 20*r.Intn(14)), float64(60 + 20*r.Intn(8))}
+		}
+		in.Nodes = append(in.Nodes, size)
+	}
+	connect := func(a, b int) {
+		if a == b {
+			return
+		}
+		edge := [4]int{a, b, 0, 0}
+		if r.Intn(2) == 0 {
+			edge[0], edge[1] = b, a
+		}
+		if r.Intn(3) > 0 {
+			edge[2], edge[3] = 40+r.Intn(180), 26
+		}
+		in.Edges = append(in.Edges, edge)
+	}
+	switch r.Intn(5) {
+	case 0:
+		in.Name = "tree"
+		for n := 1; n < count; n++ {
+			connect(r.Intn(n), n)
+		}
+	case 1:
+		in.Name = "chain"
+		for n := 1; n < count; n++ {
+			connect(n-1, n)
+		}
+	case 2:
+		in.Name = "groups"
+		for n := 1; n < count; n++ {
+			if r.Intn(3) > 0 {
+				connect(r.Intn(n), n)
+			}
+		}
+	case 3:
+		in.Name = "loose"
+		for e := 0; e < r.Intn(count+1); e++ {
+			connect(r.Intn(count), r.Intn(count))
+		}
+	default:
+		in.Name = "dense"
+		for n := 1; n < count; n++ {
+			connect(r.Intn(n), n)
+		}
+		for e := 0; e < 1+count/2; e++ {
+			connect(r.Intn(count), r.Intn(count))
+		}
+	}
+	return in
+}
+
+// withSeedScores records a diagram, and with STAGES_SEEDS the score of each of the three
+// seeds as well.
+func withSeedScores(t *testing.T, in stagesInput) stagesCase {
+	c := stagesOf(t, in)
+	if os.Getenv("STAGES_SEEDS") == "" || c.Score == nil {
+		return c
+	}
+	for seed := int64(1); seed <= 3; seed++ {
+		other := in
+		other.Seed = seed
+		c.SeedScores = append(c.SeedScores, stagesOf(t, other).Score)
+	}
+	return c
+}
+
+func TestExportStagesReference(t *testing.T) {
+	out := os.Getenv("STAGES_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set STAGES_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(20261125))
+	var cases []stagesCase
+	for len(cases) < 200 {
+		cases = append(cases, withSeedScores(t, stagesCards(r, 12)))
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []stagesInput
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, in := range extra {
+			in.Name = "found"
+			cases = append(cases, withSeedScores(t, in))
+		}
+	}
+	plain, moved := 0, map[string]int{}
+	for _, c := range cases {
+		if !c.Trees && !c.Hierarchies && !c.Clusters && !c.Sequences {
+			plain++
+		}
+		for _, m := range c.Moved {
+			moved[m.Stage]++
+		}
+	}
+	t.Logf("%d cases, %d without trees, hierarchies, clusters and sequences; moved by: %v", len(cases), plain, moved)
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestStagesProbe answers layouts made elsewhere: PROBE_IN holds a list of inputs, PROBE_OUT gets
+// TALA's answers in the same order.
+func TestStagesProbe(t *testing.T) {
+	in, out := os.Getenv("PROBE_IN"), os.Getenv("PROBE_OUT")
+	if in == "" || out == "" {
+		t.Skip("set PROBE_IN and PROBE_OUT")
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inputs []stagesInput
+	if err := json.Unmarshal(data, &inputs); err != nil {
+		t.Fatal(err)
+	}
+	answers := make([]stagesCase, 0, len(inputs))
+	for _, input := range inputs {
+		answers = append(answers, withSeedScores(t, input))
+	}
+	result, err := json.Marshal(answers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

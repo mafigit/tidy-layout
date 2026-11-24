@@ -1,0 +1,132 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout: where TALA
+// puts the labels of connections, after routing them. Not part of TALA: it only calls TALA's own
+// functions and records what they answer. Uses the helpers of the other recorders.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"reflect"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+)
+
+type labelPlace struct {
+	// Position: D2's label.Position as a number. Percentage: how far along the route, for the
+	// positions that are not fixed to a quarter, half or three quarters.
+	Position   int     `json:"position"`
+	Percentage float64 `json:"percentage"`
+	// X, Y: the top-left corner of the label's box.
+	X float64 `json:"x"`
+	Y float64 `json:"y"`
+}
+
+type labelsCase struct {
+	Kind  string    `json:"kind"`
+	Cards []ovgCard `json:"cards"`
+	Links [][2]int  `json:"links"`
+	// Sizes: per link the width and height of its label; 0 by 0 for a link without a label.
+	Sizes [][2]float64 `json:"sizes"`
+	// Routes: per link the points of its route after all of RouteEdges.
+	Routes [][][2]float64 `json:"routes"`
+	// Reordered: the labels made RouteEdges swap routes of doubled connections.
+	Reordered bool `json:"reordered,omitempty"`
+	// Places: per link where its label was put; null without a label.
+	Places []*labelPlace `json:"places"`
+}
+
+func labelsOf(t *testing.T, r *rand.Rand, kind string, cards []ovgCard, links [][2]int, sizes [][2]float64) labelsCase {
+	ctx := context.Background()
+	c := labelsCase{Kind: kind, Cards: cards, Links: links, Sizes: sizes, Places: []*labelPlace{}}
+	if len(links) == 0 {
+		c.Links, c.Sizes, c.Routes = [][2]int{}, [][2]float64{}, [][][2]float64{}
+		return c
+	}
+	label := func(edges []*layoutgraph.Edge) {
+		for i, edge := range edges {
+			if sizes[i][0] > 0 {
+				edge.Label = &layoutgraph.Label{Text: "label", Width: sizes[i][0], Height: sizes[i][1]}
+			}
+		}
+	}
+	// Without labels, to see whether they change the routes.
+	g, edges := stepsGraph(cards, links)
+	if err := RouteEdges(ctx, g, edges); err != nil {
+		t.Fatal(err)
+	}
+	plain := stepsPoints(edges)
+
+	g, edges = stepsGraph(cards, links)
+	label(edges)
+	if err := RouteEdges(ctx, g, edges); err != nil {
+		t.Fatal(err)
+	}
+	c.Routes = stepsPoints(edges)
+	c.Reordered = !reflect.DeepEqual(plain, c.Routes)
+	for _, edge := range edges {
+		if edge.Label == nil {
+			c.Places = append(c.Places, nil)
+			continue
+		}
+		topLeft := edge.LabelTopLeft(edge.Label.Position, edge.Label.Width, edge.Label.Height)
+		c.Places = append(c.Places, &labelPlace{
+			Position:   int(edge.Label.Position),
+			Percentage: edge.LabelPercentage,
+			X:          topLeft.X,
+			Y:          topLeft.Y,
+		})
+	}
+	return c
+}
+
+// labelSizes gives most links a label: one line of text of some width, sometimes two lines.
+func labelSizes(r *rand.Rand, links int) [][2]float64 {
+	sizes := make([][2]float64, links)
+	for i := range sizes {
+		if r.Intn(10) < 7 {
+			sizes[i] = [2]float64{float64(30 + r.Intn(290)), 22}
+			if r.Intn(8) == 0 {
+				sizes[i][1] = 38
+			}
+		}
+	}
+	return sizes
+}
+
+func TestExportLabelsReference(t *testing.T) {
+	out := os.Getenv("LABELS_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set LABELS_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(2026112201))
+	var cases []labelsCase
+	for i := 0; i < 240; i++ {
+		kind, cards, links := searchCards(r, i)
+		cases = append(cases, labelsOf(t, r, kind, cards, links, labelSizes(r, len(links))))
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by the probe (docs/reference.md, "Finding cases"): with label sizes.
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []probeCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			cases = append(cases, labelsOf(t, r, "found", c.Cards, c.Links, c.Sizes))
+		}
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

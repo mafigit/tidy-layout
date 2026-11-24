@@ -1,0 +1,9 @@
+package routing
+
+import "github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+
+// addTopLevel adds a card as TALA's adapter adds one that lies in no container.
+func addTopLevel(g *layoutgraph.Graph, node *layoutgraph.Node) *layoutgraph.Node {
+	g.AddNewNodeToContainer(nil, node)
+	return node
+}

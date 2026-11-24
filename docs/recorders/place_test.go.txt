@@ -1,0 +1,414 @@
+package placement
+
+// Reference cases for the Rust port tidy-layout.
+// Not part of TALA: it only calls TALA's own functions and records what they answer.
+//
+// Node placement for one connected group of cards (placeNodesOrthogonally): the first
+// arrangement, the sizeless optimizer with compaction, the change to real sizes, the sized
+// optimizer with compaction, and the last passes without temperature. The recorder runs the
+// same steps as placeNodesOrthogonally one by one, keeps where the cards are after each stage,
+// and checks that the real function ends in the same places.
+
+import (
+	"context"
+	"encoding/json"
+	"math"
+	"math/rand"
+	"os"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/grouping"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/proximity"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type placeInput struct {
+	Name string `json:"name"`
+	// width, height
+	Nodes [][2]float64 `json:"nodes"`
+	// from, to (index into nodes), and the room the label needs (0, 0 without a label)
+	Edges [][4]int `json:"edges"`
+	Seed  int64    `json:"seed"`
+	// TALA's number of each card, where it is not its place in nodes (a group taken out of a
+	// larger graph). Empty: the numbers are the places.
+	Ids []int `json:"ids,omitempty"`
+	// Also keep a number for the places after every step of the two loops.
+	Trace bool `json:"trace,omitempty"`
+	// Run TALA's cluster stage first: the group is then placed with a vessel for every cluster,
+	// and the places are those of the cards left in the graph, then of the vessels.
+	Clusters bool `json:"clusters,omitempty"`
+}
+
+type placeStage struct {
+	// Where the cards are.
+	At [][2]float64 `json:"at"`
+	// How many random numbers were drawn so far.
+	Drawn int `json:"drawn"`
+}
+
+type placeCase struct {
+	placeInput
+	Cell float64 `json:"cell"`
+	// Whether the first arrangement is the one by graph distance (even seeds, 4 to 64 cards).
+	ByDistance bool `json:"byDistance"`
+	// In cells: the first arrangement, and the end of the sizeless loop.
+	First    placeStage `json:"first"`
+	Sizeless placeStage `json:"sizeless"`
+	// In pixels: after the change to real sizes, moved onto the grid, after the sized loop, and
+	// after the last passes without temperature.
+	Inflated placeStage `json:"inflated"`
+	OnGrid   placeStage `json:"onGrid"`
+	TurnCost float64    `json:"turnCost"`
+	Sized    placeStage `json:"sized"`
+	Final    placeStage `json:"final"`
+	// With trace: per step of the sizeless loop, then of the sized loop, the numbers drawn so far
+	// and a number made of all places, after the optimizer and after the compaction (if any).
+	Steps [][2]int64 `json:"steps,omitempty"`
+	// For looking into one case (PLACE_DUMP=1): all places after every step.
+	Dump [][][2]float64 `json:"dump,omitempty"`
+}
+
+func placeGraph(t *testing.T, in placeInput) (*layoutgraph.Graph, []*layoutgraph.Node, []*layoutgraph.EdgeAbduction) {
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(in.Nodes))
+	for i, n := range in.Nodes {
+		id := i + 1
+		if len(in.Ids) > 0 {
+			id = in.Ids[i] + 1
+		}
+		node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(id), n[0], n[1]))
+		nodes = append(nodes, node)
+	}
+	for _, e := range in.Edges {
+		edge := g.Connect(nodes[e[0]], nodes[e[1]])
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		if e[2] > 0 || e[3] > 0 {
+			edge.MinWidth, edge.MinHeight = e[2], e[3]
+			edge.Label = &layoutgraph.Label{Text: "label", Width: float64(e[2]), Height: float64(e[3])}
+		}
+	}
+	abductions := []*layoutgraph.EdgeAbduction{}
+	if in.Clusters {
+		// As the pipeline does it: before any card has a place.
+		if err := grouping.AddClusters(context.Background(), g, in.Seed, rand.New(rand.NewSource(in.Seed))); err != nil {
+			t.Fatal(err)
+		}
+		nodes = append([]*layoutgraph.Node{}, g.Nodes...)
+		for _, vessel := range g.ClusterOrder() {
+			abductions = append(abductions, g.Clusters[vessel].EdgeAbductions...)
+		}
+	}
+	for _, node := range nodes {
+		node.TopLeft = geo.NewPoint(0, 0)
+	}
+	g.ComputeCellSize()
+	if err := proximity.AddHubs(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	return g, nodes, abductions
+}
+
+func placeOf(t *testing.T, in placeInput) placeCase {
+	ctx := context.Background()
+	subgraph, nodes, abductions := placeGraph(t, in)
+	c := placeCase{placeInput: in, Cell: subgraph.CellSize}
+	numbers := &tape{source: rand.NewSource(in.Seed)}
+	randGenerator := rand.New(numbers)
+	drawn := 0
+	stage := func() placeStage {
+		drawn += numbers.take()
+		at := make([][2]float64, len(nodes))
+		for i, node := range nodes {
+			at[i] = [2]float64{node.TopLeft.X, node.TopLeft.Y}
+		}
+		return placeStage{At: at, Drawn: drawn}
+	}
+	step := func() {
+		if !in.Trace {
+			return
+		}
+		s := stage()
+		var sum int64
+		for i, at := range s.At {
+			sum += int64(i+1) * (int64(at[0])*1000003 + int64(at[1]))
+		}
+		c.Steps = append(c.Steps, [2]int64{int64(s.Drawn), sum})
+		if os.Getenv("PLACE_DUMP") != "" {
+			c.Dump = append(c.Dump, s.At)
+		}
+	}
+	// From here on: placeNodesOrthogonally, step by step.
+	initialized := false
+	var err error
+	if in.Seed%2 == 0 {
+		initialized, err = initializeByGraphDistance(ctx, subgraph)
+	}
+	if err == nil && !initialized {
+		err = initializeNodes(ctx, subgraph)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	subgraph.SyncNestedGeometry()
+	c.ByDistance = initialized
+	c.First = stage()
+
+	numIterations := int(float64(nodePlacementIterations) * math.Sqrt(float64(len(subgraph.Nodes))))
+	temp := 2 * math.Sqrt(float64(len(subgraph.Nodes)))
+	coolingFactor := math.Pow(0.2/temp, 1.0/float64(numIterations))
+	compactionIteration := 9
+	compactionAxis := horizontalAxis
+
+	sizeless, err := newSizelessOptimizer(ctx, subgraph, randGenerator)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < numIterations/2; i++ {
+		if err := sizeless.optimize(ctx, temp); err != nil {
+			t.Fatal(err)
+		}
+		step()
+		if (i % compactionIteration) == 0 {
+			if err := compaction(ctx, subgraph, compactionOptions{axis: compactionAxis, factor: compactionFactor}); err != nil {
+				t.Fatal(err)
+			}
+			compactionAxis = compactionAxis.opposite()
+			sizeless.resetOccupied()
+			step()
+		}
+		temp = temp * coolingFactor
+	}
+	c.Sizeless = stage()
+
+	for _, axis := range []layoutAxis{horizontalAxis, verticalAxis} {
+		if err := compaction(ctx, subgraph, compactionOptions{edgeAbductions: abductions, axis: axis, includeSizes: true, factor: compactionFactor, transition: true}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Inflated = stage()
+	if err := validateCellSize(subgraph); err != nil {
+		t.Fatal(err)
+	}
+	for _, n := range subgraph.Nodes {
+		x, y := n.TopLeft.X, n.TopLeft.Y
+		if math.Mod(n.TopLeft.X, subgraph.CellSize) != 0 {
+			x = roundToPreviousCellSize(n.TopLeft.X, subgraph.CellSize)
+		}
+		if math.Mod(n.TopLeft.Y, subgraph.CellSize) != 0 {
+			y = roundToPreviousCellSize(n.TopLeft.Y, subgraph.CellSize)
+		}
+		if x != n.TopLeft.X || y != n.TopLeft.Y {
+			n.MoveAbsWithChildren(x, y)
+		}
+	}
+	if err := validateGridAlignment(subgraph); err != nil {
+		t.Fatal(err)
+	}
+	c.OnGrid = stage()
+	subgraph.TurnCost()
+	subgraph.HalveTurnCost()
+	c.TurnCost = subgraph.TurnCost()
+
+	sized, err := newSizedOptimizer(ctx, subgraph, nil, abductions, randGenerator, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	proximity.SyncHerdFences(subgraph)
+	for i := (numIterations / 2) + 1; i < numIterations; i++ {
+		if _, err := sized.optimize(ctx, temp); err != nil {
+			t.Fatal(err)
+		}
+		step()
+		if (i % compactionIteration) == 0 {
+			factor := math.Max(1.0, 1.0+(2.0*float64(numIterations-i-30)/(0.5*float64(numIterations))))
+			if err := compaction(ctx, subgraph, compactionOptions{edgeAbductions: abductions, axis: compactionAxis, includeSizes: true, factor: factor}); err != nil {
+				t.Fatal(err)
+			}
+			compactionAxis = compactionAxis.opposite()
+			if err := grouping.JoinDistancedClusters(ctx, subgraph); err != nil {
+				t.Fatal(err)
+			}
+			proximity.SyncHerdFences(subgraph)
+			step()
+		}
+		temp = temp * coolingFactor
+	}
+	if err := grouping.JoinDistancedClusters(ctx, subgraph); err != nil {
+		t.Fatal(err)
+	}
+	proximity.SyncHerdFences(subgraph)
+	c.Sized = stage()
+	for i := 0; i < 10; i++ {
+		changed, err := sized.optimize(ctx, 0.0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		step()
+		if !changed {
+			break
+		}
+	}
+	c.Final = stage()
+	if c.TurnCost != subgraph.TurnCost() {
+		t.Fatalf("the turn cost changed during the sized loop")
+	}
+
+	// The real thing must end in the same places with the same count of random numbers.
+	real, realNodes, realAbductions := placeGraph(t, in)
+	realNumbers := &tape{source: rand.NewSource(in.Seed)}
+	if err := placeNodesOrthogonally(ctx, nil, real, realAbductions, rand.New(realNumbers), nil, in.Seed); err != nil {
+		t.Fatal(err)
+	}
+	if realNumbers.take() != c.Final.Drawn {
+		t.Fatalf("placeNodesOrthogonally drew another count of random numbers than the recorder's steps")
+	}
+	for i, node := range realNodes {
+		if node.TopLeft.X != c.Final.At[i][0] || node.TopLeft.Y != c.Final.At[i][1] {
+			t.Fatalf("placeNodesOrthogonally ends elsewhere than the recorder's steps: card %d", i)
+		}
+	}
+	return c
+}
+
+// placeCards makes one connected group of cards: a tree, a chain, stars or a ring, with a few
+// more connections now and then.
+func placeCards(r *rand.Rand, most int) placeInput {
+	in := placeInput{Edges: [][4]int{}, Seed: 1 + r.Int63n(1000)}
+	count := 2 + r.Intn(most-1)
+	uniform := r.Intn(3) > 0
+	for n := 0; n < count; n++ {
+		size := [2]float64{220, 120}
+		if !uniform {
+			size = [2]float64{float64(60 + 20*r.Intn(14)), float64(60 + 20*r.Intn(8))}
+		}
+		in.Nodes = append(in.Nodes, size)
+	}
+	connect := func(a, b int) {
+		edge := [4]int{a, b, 0, 0}
+		if r.Intn(2) == 0 {
+			edge[0], edge[1] = b, a
+		}
+		if r.Intn(4) == 0 {
+			edge[2], edge[3] = 30+r.Intn(200), 20+r.Intn(30)
+		}
+		in.Edges = append(in.Edges, edge)
+		if r.Intn(12) == 0 {
+			for k := 0; k < 1+r.Intn(3); k++ {
+				more := edge
+				if r.Intn(2) == 0 {
+					more[2], more[3] = 30+r.Intn(200), 20+r.Intn(30)
+				}
+				in.Edges = append(in.Edges, more)
+			}
+		}
+	}
+	switch r.Intn(4) {
+	case 0:
+		in.Name = "tree"
+		for n := 1; n < count; n++ {
+			connect(r.Intn(n), n)
+		}
+	case 1:
+		in.Name = "chain"
+		for n := 1; n < count; n++ {
+			connect(n-1, n)
+		}
+	case 2:
+		in.Name = "stars"
+		centres := 1 + r.Intn(2)
+		if centres > count-1 {
+			centres = 1
+		}
+		for n := centres; n < count; n++ {
+			connect(r.Intn(centres), n)
+		}
+		if centres > 1 {
+			connect(0, 1)
+		}
+	default:
+		in.Name = "ring"
+		for n := 1; n < count; n++ {
+			connect(n-1, n)
+		}
+		if count > 2 {
+			connect(count-1, 0)
+		}
+	}
+	for e := r.Intn(3); e > 0 && count > 2; e-- {
+		a, b := r.Intn(count), r.Intn(count)
+		if a != b {
+			connect(a, b)
+		}
+	}
+	return in
+}
+
+func TestExportPlaceReference(t *testing.T) {
+	out := os.Getenv("PLACE_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set PLACE_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(20261124))
+	var cases []placeCase
+	for len(cases) < 120 {
+		cases = append(cases, placeOf(t, placeCards(r, 10)))
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []placeInput
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, in := range extra {
+			in.Name = "found"
+			cases = append(cases, placeOf(t, in))
+		}
+	}
+	byDistance, draws := 0, 0
+	for _, c := range cases {
+		if c.ByDistance {
+			byDistance++
+		}
+		draws += c.Final.Drawn
+	}
+	t.Logf("%d cases, %d arranged by graph distance first, %d numbers drawn", len(cases), byDistance, draws)
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestPlaceProbe answers layouts made elsewhere: PROBE_IN holds a list of inputs, PROBE_OUT gets
+// TALA's answers in the same order.
+func TestPlaceProbe(t *testing.T) {
+	in, out := os.Getenv("PROBE_IN"), os.Getenv("PROBE_OUT")
+	if in == "" || out == "" {
+		t.Skip("set PROBE_IN and PROBE_OUT")
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var inputs []placeInput
+	if err := json.Unmarshal(data, &inputs); err != nil {
+		t.Fatal(err)
+	}
+	answers := make([]placeCase, 0, len(inputs))
+	for _, input := range inputs {
+		answers = append(answers, placeOf(t, input))
+	}
+	result, err := json.Marshal(answers)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

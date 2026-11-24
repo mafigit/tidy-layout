@@ -1,0 +1,132 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout: what TALA's
+// NudgeEdgeChannels does to routes, and what quality.Inspect counts before and after it.
+// Not part of TALA: it only calls TALA's own functions and records what they answer.
+// Uses the helpers of the other recorders (search, steps, labels, top_level).
+//
+// In the pipeline the stage changes a route in one diagram of 500. Here the layouts are those
+// of the search recorder (scattered cards, rows, hubs), routed and labelled by RouteEdges.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"reflect"
+	"strconv"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/quality"
+)
+
+type nudgeCase struct {
+	Kind  string    `json:"kind"`
+	Cards []ovgCard `json:"cards"`
+	Links [][2]int  `json:"links"`
+	// Sizes: per link the width and height of its label; 0 by 0 for a link without a label.
+	Sizes [][2]float64 `json:"sizes"`
+	// Places: per link the position of its label (D2's label.Position as a number) and how far
+	// along the route it is; 0, 0 without a label.
+	Places [][2]float64 `json:"places"`
+	// Per link its route before the stage and after it.
+	Before [][][2]float64 `json:"before"`
+	After  [][][2]float64 `json:"after"`
+	// What quality.Inspect counts before and after: cards on each other, routes through cards,
+	// covered labels, crossings, detour, route length.
+	CountsBefore []float64 `json:"countsBefore"`
+	CountsAfter  []float64 `json:"countsAfter"`
+}
+
+func nudgeCounts(t *testing.T, g *layoutgraph.Graph) []float64 {
+	metrics, err := quality.Inspect(context.Background(), g)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return []float64{float64(metrics.NodeOverlaps), float64(metrics.RouteObstructions), float64(metrics.TextOcclusions), metrics.Crossings, metrics.Detour, metrics.RouteLength}
+}
+
+func nudgeOf(t *testing.T, kind string, cards []ovgCard, links [][2]int, sizes [][2]float64) nudgeCase {
+	ctx := context.Background()
+	c := nudgeCase{Kind: kind, Cards: cards, Links: links, Sizes: sizes, Places: [][2]float64{}}
+	g, edges := stepsGraph(cards, links)
+	for i, edge := range edges {
+		if sizes[i][0] > 0 {
+			edge.Label = &layoutgraph.Label{Text: "label", Width: sizes[i][0], Height: sizes[i][1]}
+		}
+	}
+	if err := RouteEdges(ctx, g, edges); err != nil {
+		t.Fatal(err)
+	}
+	c.Before = stepsPoints(edges)
+	for _, edge := range edges {
+		place := [2]float64{}
+		if edge.Label != nil {
+			place = [2]float64{float64(edge.Label.Position), edge.LabelPercentage}
+		}
+		c.Places = append(c.Places, place)
+	}
+	c.CountsBefore = nudgeCounts(t, g)
+	if err := NudgeEdgeChannels(ctx, g); err != nil {
+		t.Fatal(err)
+	}
+	c.After = stepsPoints(edges)
+	c.CountsAfter = nudgeCounts(t, g)
+	return c
+}
+
+func TestExportNudgeReference(t *testing.T) {
+	out := os.Getenv("NUDGE_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set NUDGE_REFERENCE_OUT to write the reference cases")
+	}
+	// NUDGE_SEED and NUDGE_COUNT make another set, for `probe_nudge compare`.
+	seed, count := int64(2026112401), 400
+	if value, err := strconv.ParseInt(os.Getenv("NUDGE_SEED"), 10, 64); err == nil {
+		seed = value
+	}
+	if value, err := strconv.Atoi(os.Getenv("NUDGE_COUNT")); err == nil {
+		count = value
+	}
+	r := rand.New(rand.NewSource(seed))
+	var cases []nudgeCase
+	// The stage changes a route in one layout of 50. Half of the cases are such layouts: of
+	// those it leaves alone, only so many are kept.
+	changed, unchanged := 0, 0
+	for i := 0; len(cases) < count; i++ {
+		kind, cards, links := searchCards(r, i)
+		if len(links) == 0 {
+			continue
+		}
+		c := nudgeOf(t, kind, cards, links, labelSizes(r, len(links)))
+		if !reflect.DeepEqual(c.Before, c.After) {
+			changed++
+		} else if unchanged++; unchanged > count/2 {
+			continue
+		}
+		cases = append(cases, c)
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by the probe (docs/reference.md, "Finding cases").
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []nudgeCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			cases = append(cases, nudgeOf(t, "found", c.Cards, c.Links, c.Sizes))
+		}
+	}
+	t.Logf("%d cases, the stage changes a route in %d", len(cases), changed)
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,23 @@
+#!/bin/sh
+# `bin/build` compiles the engine to WebAssembly into pkg/; `bin/build test` runs the Rust tests
+# first. Where an earlier step has built pkg/ already (a Docker stage, for example),
+# TIDY_LAYOUT_PREBUILT=1 makes this only check that the file is there.
+# Plain sh: it also runs on Alpine, which has no bash.
+set -eu
+cd "$(dirname "$0")/.."
+
+wasm=pkg/tidy_layout.wasm
+if [ "${TIDY_LAYOUT_PREBUILT:-}" = 1 ]; then
+  [ -f "$wasm" ] || { echo "bin/build: TIDY_LAYOUT_PREBUILT is set but $wasm is missing" >&2; exit 1; }
+  exit 0
+fi
+command -v cargo >/dev/null || { echo "bin/build: cargo not found; install Rust with the wasm32-unknown-unknown target" >&2; exit 1; }
+
+case "${1:-build}" in
+  test) cargo test --locked ;;
+  build) ;;
+  *) echo "usage: bin/build [build|test]" >&2; exit 2 ;;
+esac
+cargo build --release --locked --target wasm32-unknown-unknown
+mkdir -p pkg
+cp target/wasm32-unknown-unknown/release/tidy_layout.wasm "$wasm"

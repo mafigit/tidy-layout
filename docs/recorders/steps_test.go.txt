@@ -1,0 +1,189 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout: what each of
+// TALA's steps after the route search does to the routes of a layout. Not part of TALA: it only
+// calls TALA's own functions, in the order RouteEdges calls them, and records the routes after
+// each. Uses the helpers of the other recorders.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"reflect"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type stepsCase struct {
+	Kind  string    `json:"kind"`
+	Cards []ovgCard `json:"cards"`
+	Links [][2]int  `json:"links"`
+	// Distances: the sum of the routes' prices in each of the three orders of routing.
+	Distances []float64 `json:"distances"`
+	// Costs: per link, what its searched route costs and what a straight line would cost
+	// (estimateRouteCost and routeLine, as tryStraightEdgeFallback compares them, before the
+	// discount for a short jog). No second number: no straight line is possible.
+	Costs [][]float64 `json:"costs"`
+	// Per step, per link: the points of its route, as numbers (a step can leave whole pixels).
+	Searched     [][][2]float64 `json:"searched"`
+	Straightened [][][2]float64 `json:"straightened"`
+	Balanced     [][][2]float64 `json:"balanced"`
+	Traced       [][][2]float64 `json:"traced"`
+	Reordered    [][][2]float64 `json:"reordered"`
+}
+
+// stepsGraph is routesGraph without leaving out cards that are close together.
+func stepsGraph(cards []ovgCard, links [][2]int) (*layoutgraph.Graph, []*layoutgraph.Edge) {
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(cards))
+	for n, card := range cards {
+		node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), card.Width, card.Height))
+		node.TopLeft = geo.NewPoint(card.X, card.Y)
+		nodes = append(nodes, node)
+	}
+	var edges []*layoutgraph.Edge
+	for _, link := range links {
+		edge := g.Connect(nodes[link[0]], nodes[link[1]])
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		edges = append(edges, edge)
+	}
+	return g, edges
+}
+
+func stepsPoints(edges []*layoutgraph.Edge) [][][2]float64 {
+	out := make([][][2]float64, 0, len(edges))
+	for _, edge := range edges {
+		points := [][2]float64{}
+		for _, p := range edge.Points {
+			points = append(points, [2]float64{p.X, p.Y})
+		}
+		out = append(out, points)
+	}
+	return out
+}
+
+func stepsOf(t *testing.T, kind string, cards []ovgCard, links [][2]int) stepsCase {
+	ctx := context.Background()
+	c := stepsCase{Kind: kind, Cards: cards, Links: links}
+	if len(links) == 0 {
+		c.Links = [][2]int{}
+		return c
+	}
+	g, edges := stepsGraph(cards, links)
+	guard, err := newRouteWorkGuard(ctx, "steps", maxRouteStageWorkUnits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.ComputeCellSize()
+	{
+		ovg, err := buildOVGFromGraphWithLimits(ctx, g, nil, defaultOVGBuildLimits())
+		if err != nil {
+			t.Fatal(err)
+		}
+		g.CrossingCost()
+		g.TurnCost()
+		g.NonCenterPortCost()
+		for _, flavor := range []RouteGenerationFlavor{ShortestToLongest, LongestToShortest, Default} {
+			router, err := newOVGEdgeRouterWithWorkLimit(ctx, flavor, ovg, g, nil, edges, maxRouteSearchWorkUnits)
+			if err != nil {
+				t.Fatal(err)
+			}
+			router.considerNodeLabels = true
+			response := router.generateRoutes(ctx, false)
+			if response.Err != nil {
+				t.Fatalf("%s: %v", flavor, response.Err)
+			}
+			c.Distances = append(c.Distances, response.Distance)
+		}
+	}
+	if _, err := routeAdditionalEdgesWithLimits(ctx, g, edges, defaultOVGBuildLimits()); err != nil {
+		t.Fatal(err)
+	}
+	c.Searched = stepsPoints(edges)
+	for _, edge := range edges {
+		original, err := estimateRouteCostGuarded(layoutgraph.Edges(g.Edges), edge, guard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		costs := []float64{original}
+		if _, _, line, err := routeLineGuarded(g, edge, g.Edges, nil, guard); err == nil {
+			costs = append(costs, line)
+		} else if !layoutgraph.IsCandidateRejection(err) {
+			t.Fatal(err)
+		}
+		c.Costs = append(c.Costs, costs)
+		if err := tryStraightEdgeFallbackGuarded(g, edge, guard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Straightened = stepsPoints(edges)
+	var locked, regular []*layoutgraph.Edge
+	for _, edge := range edges {
+		if isSpecialEdgeForBalancing(g, edge) {
+			locked = append(locked, edge)
+		} else {
+			regular = append(regular, edge)
+		}
+	}
+	if err := balanceRegularEdgesGuarded(g, locked, regular, guard); err != nil {
+		t.Fatal(err)
+	}
+	c.Balanced = stepsPoints(edges)
+	for _, edge := range edges {
+		if err := traceToShapeBorderGuarded(edge, guard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	c.Traced = stepsPoints(edges)
+	if err := reorderDuplicatesInEdgesGuarded(edges, guard); err != nil {
+		t.Fatal(err)
+	}
+	c.Reordered = stepsPoints(edges)
+
+	// The steps above must be the ones RouteEdges runs: same routes from the real thing.
+	g, edges = stepsGraph(cards, links)
+	if err := RouteEdges(ctx, g, edges); err != nil {
+		t.Fatal(err)
+	}
+	if real := stepsPoints(edges); !reflect.DeepEqual(real, c.Reordered) {
+		t.Fatalf("RouteEdges gives other routes than its steps one by one:\n%v\n%v", real, c.Reordered)
+	}
+	return c
+}
+
+func TestExportStepsReference(t *testing.T) {
+	out := os.Getenv("STEPS_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set STEPS_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(2026112107))
+	var cases []stepsCase
+	for i := 0; i < 240; i++ {
+		kind, cards, links := searchCards(r, i)
+		cases = append(cases, stepsOf(t, kind, cards, links))
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by the probe (docs/reference.md, "Finding cases").
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []probeCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			cases = append(cases, stepsOf(t, "found", c.Cards, c.Links))
+		}
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

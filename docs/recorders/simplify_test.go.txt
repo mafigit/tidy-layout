@@ -1,0 +1,225 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout.
+// Not part of TALA: it only runs TALA's own SimplifyEdgeRoutes and records what it does.
+//
+// The stage takes a hook out of a route. The router makes such a hook in about one diagram
+// of 44,000, so the routes here are made up: walks of upright and level pieces from a port of
+// the first card, half of them with a hook built in, some ending on the second card.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"strconv"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type simplifyCase struct {
+	// x, y, width, height
+	Cards [][4]float64 `json:"cards"`
+	// from, to (index into cards)
+	Links [][2]int `json:"links"`
+	// Per connection its route before the stage and after it.
+	Before [][][2]float64 `json:"before"`
+	After  [][][2]float64 `json:"after"`
+}
+
+func simplifyApart(cards [][4]float64, k [4]float64, skip int) bool {
+	for i, o := range cards {
+		if i != skip && k[0] < o[0]+o[2]+20 && o[0] < k[0]+k[2]+20 && k[1] < o[1]+o[3]+20 && o[1] < k[1]+k[3]+20 {
+			return false
+		}
+	}
+	return true
+}
+
+func simplifyCards(r *rand.Rand) simplifyCase {
+	sizes := [][2]float64{{220, 120}, {220, 120}, {160, 80}, {60, 60}, {120, 200}}
+	count := 2 + r.Intn(5)
+	c := simplifyCase{}
+	for tries := 0; len(c.Cards) < count && tries < 300; tries++ {
+		s := sizes[r.Intn(len(sizes))]
+		k := [4]float64{float64(r.Intn(100)) * 10, float64(r.Intn(70)) * 10, s[0], s[1]}
+		if simplifyApart(c.Cards, k, -1) {
+			c.Cards = append(c.Cards, k)
+		}
+	}
+	for n := 1 + r.Intn(4); n > 0; n-- {
+		a, b := r.Intn(len(c.Cards)), r.Intn(len(c.Cards))
+		if a == b {
+			continue
+		}
+		from := c.Cards[a]
+		// A port of the first card, and the way out of it.
+		share := []float64{0.25, 0.5, 0.75}[r.Intn(3)]
+		side := r.Intn(4)
+		at := [2]float64{from[0] + share*from[2], from[1]}
+		level, sign := false, -1.0
+		switch side {
+		case 1:
+			at = [2]float64{from[0] + share*from[2], from[1] + from[3]}
+			sign = 1
+		case 2:
+			at = [2]float64{from[0], from[1] + share*from[3]}
+			level = true
+		case 3:
+			at = [2]float64{from[0] + from[2], from[1] + share*from[3]}
+			level, sign = true, 1
+		}
+		if r.Intn(7) == 0 {
+			sign = -sign
+		}
+		route := [][2]float64{at}
+		step := func(length float64) {
+			last := route[len(route)-1]
+			if level {
+				route = append(route, [2]float64{last[0] + length, last[1]})
+			} else {
+				route = append(route, [2]float64{last[0], last[1] + length})
+			}
+			level = !level
+		}
+		length := func() float64 { return float64(1+r.Intn(30)) * 10 }
+		either := func() float64 {
+			if r.Intn(2) == 0 {
+				return -1
+			}
+			return 1
+		}
+		step(sign * length())
+		pieces := 1 + r.Intn(6)
+		hook := -1
+		if r.Intn(2) == 0 {
+			hook = r.Intn(pieces)
+		}
+		for piece := 0; piece < pieces; piece++ {
+			if piece != hook {
+				step(either() * length())
+				continue
+			}
+			// A hook: across, on in the direction of the piece before, and back across.
+			last, before := route[len(route)-1], route[len(route)-2]
+			on := 1.0
+			if last[0] < before[0] || last[1] < before[1] {
+				on = -1
+			}
+			aside := either()
+			step(aside * length())
+			step(on * length())
+			step(-aside * length())
+		}
+		// Now and then the second card stands where the route ends.
+		end := route[len(route)-1]
+		to := c.Cards[b]
+		if r.Intn(5) < 2 {
+			moved := [4]float64{end[0] - to[2]/2, end[1], to[2], to[3]}
+			switch r.Intn(4) {
+			case 1:
+				moved = [4]float64{end[0] - to[2]/2, end[1] - to[3], to[2], to[3]}
+			case 2:
+				moved = [4]float64{end[0], end[1] - to[3]/2, to[2], to[3]}
+			case 3:
+				moved = [4]float64{end[0] - to[2], end[1] - to[3]/2, to[2], to[3]}
+			}
+			if simplifyApart(c.Cards, moved, b) {
+				c.Cards[b] = moved
+			}
+		}
+		c.Links = append(c.Links, [2]int{a, b})
+		c.Before = append(c.Before, route)
+	}
+	return c
+}
+
+func simplifyOf(t *testing.T, c *simplifyCase) {
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(c.Cards))
+	for i, k := range c.Cards {
+		node := layoutgraph.NewNode(layoutgraph.EntityID(i+1), k[2], k[3])
+		g.AddNewNodeToContainer(nil, node)
+		node.TopLeft = geo.NewPoint(k[0], k[1])
+		nodes = append(nodes, node)
+	}
+	edges := make([]*layoutgraph.Edge, 0, len(c.Links))
+	for i, l := range c.Links {
+		edge := g.Connect(nodes[l[0]], nodes[l[1]])
+		for _, p := range c.Before[i] {
+			edge.Points = append(edge.Points, geo.NewPoint(p[0], p[1]))
+		}
+		edges = append(edges, edge)
+	}
+	if err := SimplifyEdgeRoutes(context.Background(), g); err != nil {
+		t.Fatal(err)
+	}
+	c.After = [][][2]float64{}
+	for _, edge := range edges {
+		route := [][2]float64{}
+		for _, p := range edge.Points {
+			route = append(route, [2]float64{p.X, p.Y})
+		}
+		c.After = append(c.After, route)
+	}
+}
+
+func TestExportSimplifyReference(t *testing.T) {
+	out := os.Getenv("SIMPLIFY_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set SIMPLIFY_REFERENCE_OUT to write the reference cases")
+	}
+	// SIMPLIFY_SEED and SIMPLIFY_COUNT make another set, for `probe_simplify compare`.
+	seed, count := int64(20261124), 1200
+	if value, err := strconv.ParseInt(os.Getenv("SIMPLIFY_SEED"), 10, 64); err == nil {
+		seed = value
+	}
+	if value, err := strconv.Atoi(os.Getenv("SIMPLIFY_COUNT")); err == nil {
+		count = value
+	}
+	r := rand.New(rand.NewSource(seed))
+	var cases []simplifyCase
+	routes, changed, twice := 0, 0, 0
+	for len(cases) < count {
+		c := simplifyCards(r)
+		if len(c.Links) == 0 {
+			continue
+		}
+		simplifyOf(t, &c)
+		for i := range c.Before {
+			routes++
+			if len(c.After[i]) < len(c.Before[i]) {
+				changed++
+			}
+			if len(c.After[i])+2 < len(c.Before[i]) {
+				twice++
+			}
+		}
+		cases = append(cases, c)
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []simplifyCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			c.After = nil
+			simplifyOf(t, &c)
+			cases = append(cases, c)
+		}
+	}
+	t.Logf("%d cases, %d routes, %d lose a hook, %d more than one", len(cases), routes, changed, twice)
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,284 @@
+package routing
+
+// A probe for the Rust port tidy-layout: reads layouts written
+// by `probe search write` or `probe routes write` and writes what TALA answers for them, in the
+// same form. Not part of TALA: it only calls TALA's own functions.
+// Uses the helpers of the reference recorders.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type probeCase struct {
+	Cards []ovgCard `json:"cards"`
+	Links [][2]int  `json:"links"`
+	// Sizes: per link the width and height of its label, in the probes that have labels.
+	Sizes   [][2]float64 `json:"sizes,omitempty"`
+	Answers []string     `json:"answers,omitempty"`
+}
+
+func probeAnswers(t *testing.T, c probeCase) []string {
+	ctx := context.Background()
+	g := layoutgraph.NewGraph()
+	nodes := make([]*layoutgraph.Node, 0, len(c.Cards))
+	for n, card := range c.Cards {
+		node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), card.Width, card.Height))
+		node.TopLeft = geo.NewPoint(card.X, card.Y)
+		nodes = append(nodes, node)
+	}
+	var edges []*layoutgraph.Edge
+	for _, link := range c.Links {
+		edge := g.Connect(nodes[link[0]], nodes[link[1]])
+		edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+		edges = append(edges, edge)
+	}
+	g.ComputeCellSize()
+	ovg, err := buildOVGFromGraphWithLimits(ctx, g, nil, defaultOVGBuildLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.CrossingCost()
+	g.TurnCost()
+	g.NonCenterPortCost()
+	router, err := newOVGEdgeRouterWithWorkLimit(ctx, Default, ovg, g, nil, edges, maxRouteSearchWorkUnits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	answers := []string{}
+	for _, edge := range router.edges {
+		found, price, err := router.search(ctx, edge)
+		if err != nil {
+			answers = append(answers, "failed")
+			continue
+		}
+		var points []string
+		for _, node := range found {
+			points = append(points, fmt.Sprintf("%d,%d", int64(node.X*4), int64(node.Y*4)))
+		}
+		answers = append(answers, fmt.Sprintf("%016x %s", math.Float64bits(price), strings.Join(points, " ")))
+		if err := router.addRoute(&Route{GEdge: edge, OVGNodes: found, FromPort: *found[1].Point, ToPort: *found[len(found)-2].Point}); err != nil {
+			answers = append(answers, "cannot add")
+			break
+		}
+	}
+	return answers
+}
+
+func probeQuarters(points []*geo.Point) string {
+	var text []string
+	for _, p := range points {
+		text = append(text, fmt.Sprintf("%d,%d", int64(p.X*4), int64(p.Y*4)))
+	}
+	return strings.Join(text, " ")
+}
+
+// probeRouteAnswers: per order its routes and the sum of their prices, then the kept route of
+// every link.
+func probeRouteAnswers(t *testing.T, c probeCase) []string {
+	ctx := context.Background()
+	g, edges, links := routesGraph(c.Cards, c.Links)
+	if len(links) != len(c.Links) {
+		t.Fatal("the probe wrote a link TALA would not search")
+	}
+	answers := []string{}
+	if len(edges) == 0 {
+		return answers
+	}
+	g.ComputeCellSize()
+	ovg, err := buildOVGFromGraphWithLimits(ctx, g, nil, defaultOVGBuildLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.CrossingCost()
+	g.TurnCost()
+	g.NonCenterPortCost()
+	index := map[*layoutgraph.Edge]int{}
+	for i, edge := range edges {
+		index[edge] = i
+	}
+	for _, flavor := range []RouteGenerationFlavor{ShortestToLongest, LongestToShortest, Default} {
+		router, err := newOVGEdgeRouterWithWorkLimit(ctx, flavor, ovg, g, nil, edges, maxRouteSearchWorkUnits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router.considerNodeLabels = true
+		response := router.generateRoutes(ctx, false)
+		if response.Err != nil {
+			answers = append(answers, "failed")
+			continue
+		}
+		var routes []string
+		for _, route := range response.Routes {
+			var points []*geo.Point
+			for _, node := range route.OVGNodes {
+				points = append(points, node.Point)
+			}
+			routes = append(routes, fmt.Sprintf("%d:%s", index[route.GEdge], probeQuarters(points)))
+		}
+		answers = append(answers, fmt.Sprintf("%016x %s", math.Float64bits(response.Distance), strings.Join(routes, ";")))
+	}
+	g, edges, _ = routesGraph(c.Cards, c.Links)
+	g.ComputeCellSize()
+	if _, err := routeAdditionalEdgesWithLimits(ctx, g, edges, defaultOVGBuildLimits()); err != nil {
+		return append(answers, "failed")
+	}
+	for _, edge := range edges {
+		answers = append(answers, probeQuarters(edge.Points))
+	}
+	return answers
+}
+
+// probeStepAnswers: the sum of prices per order, then per link its route after the search, after
+// the straight lines and after all steps of RouteEdges.
+func probeStepAnswers(t *testing.T, c probeCase) []string {
+	ctx := context.Background()
+	answers := []string{}
+	if len(c.Links) == 0 {
+		return answers
+	}
+	g, edges := stepsGraph(c.Cards, c.Links)
+	guard, err := newRouteWorkGuard(ctx, "probe", maxRouteStageWorkUnits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.ComputeCellSize()
+	ovg, err := buildOVGFromGraphWithLimits(ctx, g, nil, defaultOVGBuildLimits())
+	if err != nil {
+		t.Fatal(err)
+	}
+	g.CrossingCost()
+	g.TurnCost()
+	g.NonCenterPortCost()
+	for _, flavor := range []RouteGenerationFlavor{ShortestToLongest, LongestToShortest, Default} {
+		router, err := newOVGEdgeRouterWithWorkLimit(ctx, flavor, ovg, g, nil, edges, maxRouteSearchWorkUnits)
+		if err != nil {
+			t.Fatal(err)
+		}
+		router.considerNodeLabels = true
+		response := router.generateRoutes(ctx, false)
+		if response.Err != nil {
+			answers = append(answers, "failed")
+			continue
+		}
+		answers = append(answers, fmt.Sprintf("%016x", math.Float64bits(response.Distance)))
+	}
+	if _, err := routeAdditionalEdgesWithLimits(ctx, g, edges, defaultOVGBuildLimits()); err != nil {
+		return append(answers, "failed")
+	}
+	for _, edge := range edges {
+		answers = append(answers, probeQuarters(edge.Points))
+	}
+	for _, edge := range edges {
+		if err := tryStraightEdgeFallbackGuarded(g, edge, guard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, edge := range edges {
+		answers = append(answers, probeQuarters(edge.Points))
+	}
+	// The rest of RouteEdges. Spreading the routes can leave a point anywhere: every bit counts.
+	var locked, regular []*layoutgraph.Edge
+	for _, edge := range edges {
+		if isSpecialEdgeForBalancing(g, edge) {
+			locked = append(locked, edge)
+		} else {
+			regular = append(regular, edge)
+		}
+	}
+	if err := balanceRegularEdgesGuarded(g, locked, regular, guard); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range edges {
+		if err := traceToShapeBorderGuarded(edge, guard); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := reorderDuplicatesInEdgesGuarded(edges, guard); err != nil {
+		t.Fatal(err)
+	}
+	for _, edge := range edges {
+		var text []string
+		for _, p := range edge.Points {
+			text = append(text, fmt.Sprintf("%x,%x", math.Float64bits(p.X), math.Float64bits(p.Y)))
+		}
+		answers = append(answers, strings.Join(text, " "))
+	}
+	return answers
+}
+
+// probeLabelAnswers: per link its final route, then per link the place of its label (position,
+// how far along, corner) or "-".
+func probeLabelAnswers(t *testing.T, c probeCase) []string {
+	answers := []string{}
+	if len(c.Links) == 0 {
+		return answers
+	}
+	g, edges := stepsGraph(c.Cards, c.Links)
+	for i, edge := range edges {
+		if c.Sizes[i][0] > 0 {
+			edge.Label = &layoutgraph.Label{Text: "label", Width: c.Sizes[i][0], Height: c.Sizes[i][1]}
+		}
+	}
+	if err := RouteEdges(context.Background(), g, edges); err != nil {
+		return []string{"failed"}
+	}
+	for _, edge := range edges {
+		var text []string
+		for _, p := range edge.Points {
+			text = append(text, fmt.Sprintf("%x,%x", math.Float64bits(p.X), math.Float64bits(p.Y)))
+		}
+		answers = append(answers, strings.Join(text, " "))
+	}
+	for _, edge := range edges {
+		if edge.Label == nil {
+			answers = append(answers, "-")
+			continue
+		}
+		corner := edge.LabelTopLeft(edge.Label.Position, edge.Label.Width, edge.Label.Height)
+		answers = append(answers, fmt.Sprintf("%d %x %x,%x", int(edge.Label.Position), math.Float64bits(edge.LabelPercentage), math.Float64bits(corner.X), math.Float64bits(corner.Y)))
+	}
+	return answers
+}
+
+func TestProbe(t *testing.T) {
+	in, out := os.Getenv("PROBE_IN"), os.Getenv("PROBE_OUT")
+	if in == "" || out == "" {
+		t.Skip("set PROBE_IN and PROBE_OUT, and PROBE_WHAT to search, routes, steps or labels")
+	}
+	answer := probeAnswers
+	switch os.Getenv("PROBE_WHAT") {
+	case "routes":
+		answer = probeRouteAnswers
+	case "steps":
+		answer = probeStepAnswers
+	case "labels":
+		answer = probeLabelAnswers
+	}
+	data, err := os.ReadFile(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var cases []probeCase
+	if err := json.Unmarshal(data, &cases); err != nil {
+		t.Fatal(err)
+	}
+	for i := range cases {
+		cases[i].Answers = answer(t, cases[i])
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

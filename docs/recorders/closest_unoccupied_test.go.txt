@@ -1,0 +1,154 @@
+package placement
+
+// Reference cases for the Rust port tidy-layout.
+// Not part of TALA: it only calls TALA's own search and records what it answers.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/limits"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type refNode struct {
+	ID     int     `json:"id"`
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+type refCase struct {
+	Name     string     `json:"name"`
+	CellSize float64    `json:"cellSize"`
+	Nodes    []refNode  `json:"nodes"`
+	Edges    [][2]int   `json:"edges"`
+	Moving   int        `json:"moving"`
+	Point    [2]float64 `json:"point"`
+	// Distance is the ring TALA reports; -1 when it reports an error.
+	Distance float64 `json:"distance"`
+	// Found is the first free candidate on that ring, in TALA's iteration order.
+	Found *[2]float64 `json:"found"`
+}
+
+func TestExportSnapReference(t *testing.T) {
+	out := os.Getenv("SNAP_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set SNAP_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(20261121))
+	var cases []refCase
+	for i := 0; i < 500; i++ {
+		// The last 100 cases ask for the moving card's own place, with every card on the grid.
+		ownPlace := i >= 400
+		g := layoutgraph.NewGraph()
+		count := 2 + r.Intn(24)
+		uniform := ownPlace || r.Intn(3) > 0
+		nodes := make([]*layoutgraph.Node, 0, count)
+		c := refCase{}
+		for n := 0; n < count; n++ {
+			w, h := 220.0, 120.0
+			if !uniform {
+				w = float64(40 + 10*r.Intn(27))
+				h = float64(40 + 10*r.Intn(17))
+			}
+			node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), w, h))
+			// Positions as a person leaves them: anywhere, also overlapping.
+			node.TopLeft = geo.NewPoint(float64(r.Intn(1600)-200), float64(r.Intn(1100)-200))
+			if ownPlace {
+				node.TopLeft = geo.NewPoint(float64(220*(r.Intn(9)-1)), float64(220*(r.Intn(7)-1)))
+			}
+			nodes = append(nodes, node)
+			c.Nodes = append(c.Nodes, refNode{n + 1, node.TopLeft.X, node.TopLeft.Y, w, h})
+		}
+		for e := 0; e < r.Intn(count*2); e++ {
+			a, b := r.Intn(count), r.Intn(count)
+			if a == b {
+				continue
+			}
+			g.Connect(nodes[a], nodes[b])
+			c.Edges = append(c.Edges, [2]int{a + 1, b + 1})
+		}
+		g.ComputeCellSize()
+		optim, err := newSizedOptimizer(context.Background(), g, nil, nil, rand.New(rand.NewSource(1)), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		moving := nodes[r.Intn(count)]
+		// Half the time the pointer is on top of another card.
+		p := geo.NewPoint(float64(r.Intn(1600)-200), float64(r.Intn(1100)-200))
+		if r.Intn(2) == 0 {
+			other := nodes[r.Intn(count)]
+			p = geo.NewPoint(other.TopLeft.X+float64(r.Intn(80)-40), other.TopLeft.Y+float64(r.Intn(80)-40))
+		}
+		if ownPlace {
+			p = geo.NewPoint(moving.TopLeft.X+float64(r.Intn(60)-30), moving.TopLeft.Y+float64(r.Intn(60)-30))
+		}
+		c.CellSize = g.CellSize
+		c.Moving = int(moving.ID)
+		c.Point = [2]float64{p.X, p.Y}
+		d, err := optim.findClosestUnoccupiedDistanceForTest(context.Background(), moving, p, false, nil)
+		if err != nil {
+			c.Distance = -1
+		} else {
+			c.Distance = d
+			c.Found = firstFreeOnRing(t, optim, moving, p, d)
+		}
+		cases = append(cases, c)
+	}
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// firstFreeOnRing walks one ring in the order of findClosestUnoccupiedDistanceGuarded and returns
+// the first candidate TALA itself calls unoccupied.
+func firstFreeOnRing(t *testing.T, optim *sizedOptimizer, node *layoutgraph.Node, p *geo.Point, ring float64) *[2]float64 {
+	guard, err := limits.NewOptimizationWorkGuard(context.Background(), "LocalOptimize", limits.MaxOptimizationWorkUnits)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := optim.rebuildSpatialIndex(guard); err != nil {
+		t.Fatal(err)
+	}
+	cell := optim.cellSize
+	currCell := ring * cell
+	x, y := currCell, 0.0
+	free := func(dx, dy float64) *[2]float64 {
+		occupied, err := optim.isPointOccupiedGuarded(dx, dy, p, node, guard)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if occupied {
+			return nil
+		}
+		return &[2]float64{roundToNearestCellSize(p.X+dx, cell), roundToNearestCellSize(p.Y+dy, cell)}
+	}
+	for x >= -currCell {
+		if y != 0 {
+			if found := free(x, -y); found != nil {
+				return found
+			}
+		}
+		if found := free(x, y); found != nil {
+			return found
+		}
+		if x > 0 {
+			y += cell
+		} else {
+			y -= cell
+		}
+		x -= cell
+	}
+	t.Fatalf("TALA reported ring %v but no candidate on it is free", ring)
+	return nil
+}

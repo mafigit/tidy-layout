@@ -1,0 +1,233 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout: what TALA's
+// route search answers for one connection after another, each with the routes found before it in
+// the way. Not part of TALA: it only calls TALA's own functions and records what they answer.
+// Uses the helpers of reference_ovg_export_test.go.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"math/rand"
+	"os"
+	"strings"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type searchRoute struct {
+	// Link: index into the case's links.
+	Link int `json:"link"`
+	// Failed: the search returned an error (no path).
+	Failed   bool    `json:"failed,omitempty"`
+	Distance float64 `json:"distance"`
+	// Points: how many points of the graph the route passes, and a hash of all of them
+	// ("x,y x,y ..." in quarters, FNV-1a 64 bit).
+	Points int    `json:"points"`
+	Hash   string `json:"hash"`
+	// Corners: the two card centres, the two ports and every bend, in quarters.
+	Corners [][2]int64 `json:"corners"`
+}
+
+type searchCase struct {
+	Kind  string    `json:"kind"`
+	Cards []ovgCard `json:"cards"`
+	Links [][2]int  `json:"links"`
+	// The three costs TALA derives from the graph.
+	TurnCost          float64       `json:"turnCost"`
+	CrossingCost      float64       `json:"crossingCost"`
+	NonCenterPortCost float64       `json:"nonCenterPortCost"`
+	Routes            []searchRoute `json:"routes"`
+}
+
+// searchQuick tells whether TALA would join the two cards with a straight line instead of
+// searching (ovgEdgeRouter.quickRoute). Such pairs get no link here: that path is a later slice.
+func searchQuick(a, b *layoutgraph.Node) bool {
+	orientation := a.Orientation(b)
+	if orientation == geo.NONE || orientation.IsDiagonal() {
+		return false
+	}
+	distance := a.DistanceTo(b, true)
+	return distance < 2*(layoutgraph.MinRouteNodeClearance+1) && distance > layoutgraph.MinArrowheadClearance
+}
+
+func searchCards(r *rand.Rand, i int) (string, []ovgCard, [][2]int) {
+	switch {
+	case i%3 == 0:
+		// Scattered, as in the graph reference.
+		count := 2 + r.Intn(7)
+		span := 300 + 260*count
+		var cards []ovgCard
+		for len(cards) < count {
+			size := ovgSizes[len(ovgSizes)-1]
+			if r.Intn(10) < 3 {
+				size = ovgSizes[r.Intn(len(ovgSizes))]
+			}
+			card := ovgCard{Width: size[0], Height: size[1], X: float64(20 * (r.Intn(span/20) - 10)), Y: float64(20 * (r.Intn(span/30) - 10))}
+			if i%15 == 0 {
+				card.X, card.Y = float64(r.Intn(span)-200), float64(r.Intn(span*2/3)-200)
+			}
+			if ovgKeepsGap(cards, card, 20) {
+				cards = append(cards, card)
+			}
+		}
+		return "scattered", cards, ovgRandomLinks(r, count, 2*count)
+	case i%3 == 1:
+		// Rows and columns of cards of 220 by 120: many connections share rows, columns and ports.
+		gaps := []float64{20, 60, 60, 100, 140}
+		cols, rows := 2+r.Intn(3), 1+r.Intn(4)
+		gapX, gapY := gaps[r.Intn(len(gaps))], gaps[r.Intn(len(gaps))]
+		var cards []ovgCard
+		for row := 0; row < rows; row++ {
+			for col := 0; col < cols; col++ {
+				if r.Intn(6) == 0 && len(cards) > 0 {
+					continue
+				}
+				cards = append(cards, ovgCard{X: float64(col) * (220 + gapX), Y: float64(row) * (120 + gapY), Width: 220, Height: 120})
+			}
+		}
+		links := ovgRandomLinks(r, len(cards), 3*len(cards))
+		// Doubled and opposite connections.
+		for n := r.Intn(4); n > 0 && len(links) > 0; n-- {
+			link := links[r.Intn(len(links))]
+			if r.Intn(2) == 0 {
+				link = [2]int{link[1], link[0]}
+			}
+			links = append(links, link)
+		}
+		return "rows", cards, links
+	default:
+		// A hub: one card in the middle, the others around it, most connections to or from the hub.
+		count := 3 + r.Intn(6)
+		cards := []ovgCard{{X: 0, Y: 0, Width: 220, Height: 120}}
+		for len(cards) < count {
+			card := ovgCard{Width: 220, Height: 120, X: float64(20 * (r.Intn(60) - 30)), Y: float64(20 * (r.Intn(40) - 20))}
+			if ovgKeepsGap(cards, card, 60) {
+				cards = append(cards, card)
+			}
+		}
+		links := [][2]int{}
+		for n := 0; n < count+r.Intn(count); n++ {
+			other := 1 + r.Intn(count-1)
+			switch r.Intn(5) {
+			case 0, 1:
+				links = append(links, [2]int{0, other})
+			case 2, 3:
+				links = append(links, [2]int{other, 0})
+			default:
+				links = append(links, ovgRandomLinks(r, count, 1)...)
+			}
+		}
+		return "hub", cards, links
+	}
+}
+
+func TestExportSearchReference(t *testing.T) {
+	out := os.Getenv("SEARCH_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set SEARCH_REFERENCE_OUT to write the reference cases")
+	}
+	ctx := context.Background()
+	r := rand.New(rand.NewSource(2026112105))
+	var cases []searchCase
+	type layout struct {
+		kind  string
+		cards []ovgCard
+		links [][2]int
+	}
+	var layouts []layout
+	for i := 0; i < 300; i++ {
+		kind, cards, wanted := searchCards(r, i)
+		layouts = append(layouts, layout{kind, cards, wanted})
+	}
+	if found := os.Getenv("REFERENCE_FOUND"); found != "" {
+		// Layouts found by probe_search (docs/reference.md, "Finding cases").
+		data, err := os.ReadFile(found)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var extra []probeCase
+		if err := json.Unmarshal(data, &extra); err != nil {
+			t.Fatal(err)
+		}
+		for _, c := range extra {
+			layouts = append(layouts, layout{"found", c.Cards, c.Links})
+		}
+	}
+	for i, l := range layouts {
+		kind, cards, wanted := l.kind, l.cards, l.links
+		c := searchCase{Kind: kind, Cards: cards, Links: [][2]int{}}
+		g := layoutgraph.NewGraph()
+		nodes := make([]*layoutgraph.Node, 0, len(cards))
+		for n, card := range cards {
+			node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), card.Width, card.Height))
+			node.TopLeft = geo.NewPoint(card.X, card.Y)
+			nodes = append(nodes, node)
+		}
+		var edges []*layoutgraph.Edge
+		for _, link := range wanted {
+			if searchQuick(nodes[link[0]], nodes[link[1]]) {
+				continue
+			}
+			// A connection in the editor: an arrow at its target.
+			edge := g.Connect(nodes[link[0]], nodes[link[1]])
+			edge.TargetArrowhead = layoutgraph.TriangleArrowhead
+			edges = append(edges, edge)
+			c.Links = append(c.Links, link)
+		}
+		g.ComputeCellSize()
+		ovg, err := buildOVGFromGraphWithLimits(ctx, g, nil, defaultOVGBuildLimits())
+		if err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+		c.CrossingCost, c.TurnCost, c.NonCenterPortCost = g.CrossingCost(), g.TurnCost(), g.NonCenterPortCost()
+		router, err := newOVGEdgeRouterWithWorkLimit(ctx, Default, ovg, g, nil, edges, maxRouteSearchWorkUnits)
+		if err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+		c.Routes = []searchRoute{}
+		for link, edge := range router.edges {
+			if edge != edges[link] {
+				t.Fatalf("case %d: the default order is not the order of the links", i)
+			}
+			found, distance, err := router.search(ctx, edge)
+			route := searchRoute{Link: link}
+			if err != nil {
+				route.Failed = true
+				c.Routes = append(c.Routes, route)
+				continue
+			}
+			var all []string
+			for n, node := range found {
+				all = append(all, fmt.Sprintf("%d,%d", q(t, node.X), q(t, node.Y)))
+				bend := false
+				if n >= 2 && n < len(found)-2 {
+					last, next := found[n-1], found[n+1]
+					bend = (node.X == last.X && node.X != next.X) || (node.Y == last.Y && node.Y != next.Y)
+				}
+				if n < 2 || n >= len(found)-2 || bend {
+					route.Corners = append(route.Corners, [2]int64{q(t, node.X), q(t, node.Y)})
+				}
+			}
+			h := fnv.New64a()
+			h.Write([]byte(strings.Join(all, " ")))
+			route.Distance, route.Points, route.Hash = distance, len(found), fmt.Sprintf("%016x", h.Sum64())
+			c.Routes = append(c.Routes, route)
+			if err := router.addRoute(&Route{GEdge: edge, OVGNodes: found, FromPort: *found[1].Point, ToPort: *found[len(found)-2].Point}); err != nil {
+				t.Fatalf("case %d link %d: %v", i, link, err)
+			}
+		}
+		cases = append(cases, c)
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

@@ -1,0 +1,22 @@
+{
+  "name": "tidy-layout",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "license": "MPL-2.0",
+  "exports": {
+    ".": "./js/index.ts",
+    "./engine.wasm": "./pkg/tidy_layout.wasm"
+  },
+  "types": "./js/index.ts",
+  "scripts": {
+    "build:engine": "./bin/build",
+    "test": "./bin/build test && vitest run",
+    "typecheck": "tsc --noEmit"
+  },
+  "devDependencies": {
+    "@types/node": "^24.13.4",
+    "typescript": "~6.0.0",
+    "vitest": "^4.1.11"
+  }
+}

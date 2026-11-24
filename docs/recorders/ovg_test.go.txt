@@ -1,0 +1,402 @@
+package routing
+
+// Reference cases for the Rust port tidy-layout: the orthogonal
+// visibility graph TALA builds for plain cards. Not part of TALA: it only calls TALA's own
+// functions and records what they answer.
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"hash/fnv"
+	"math/rand"
+	"os"
+	"sort"
+	"strings"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type ovgCard struct {
+	X      float64 `json:"x"`
+	Y      float64 `json:"y"`
+	Width  float64 `json:"width"`
+	Height float64 `json:"height"`
+}
+
+type ovgCase struct {
+	Kind  string    `json:"kind"`
+	Cards []ovgCard `json:"cards"`
+	// Links: pairs of card indexes, in the order the connections were made.
+	Links [][2]int `json:"links"`
+	Nodes int      `json:"nodes"`
+	Edges int      `json:"edges"`
+	// Tunnels: how many points are tunnel entries. Near: how many are flagged as near a port.
+	Tunnels int `json:"tunnels"`
+	Near    int `json:"near"`
+	// Hash: FNV-1a (64 bit) of the dump, as 16 hex digits.
+	Hash string `json:"hash"`
+	// Dump: the graph in the canonical text form, for the small cases only.
+	Dump []string `json:"dump,omitempty"`
+}
+
+// q writes a coordinate in quarters, so the text has no floating point formatting in it.
+func q(t *testing.T, v float64) int64 {
+	n := int64(v * 4)
+	if float64(n) != v*4 {
+		t.Fatalf("coordinate %v is not a multiple of 0.25", v)
+	}
+	return n
+}
+
+func directionLetters(d portDirectionSet) string {
+	s := ""
+	if d.has(geo.Top) {
+		s += "T"
+	}
+	if d.has(geo.Right) {
+		s += "R"
+	}
+	if d.has(geo.Bottom) {
+		s += "B"
+	}
+	if d.has(geo.Left) {
+		s += "L"
+	}
+	return s
+}
+
+// dumpOVG writes the graph as lines that do not depend on the order of Go's maps:
+//
+//	N x y flags P owner:directions:centre,... K owner,... A x,y ...   one per point, by x, y
+//	E x y x y                                                         one per edge, in TALA's order
+//	O owner x,y ...                                                   one per card: its ports in order
+//	C owner x,y                                                       one per card: its centre point
+func dumpOVG(t *testing.T, ovg *OVG, g *layoutgraph.Graph) []string {
+	owner := map[*layoutgraph.Node]int{}
+	for i, n := range g.Nodes {
+		owner[n] = i
+	}
+	pt := func(n *OVGNode) string { return fmt.Sprintf("%d,%d", q(t, n.X), q(t, n.Y)) }
+	nodes := append([]*OVGNode(nil), ovg.Nodes...)
+	sort.SliceStable(nodes, func(i, j int) bool {
+		a, b := nodes[i], nodes[j]
+		if a.X != b.X {
+			return a.X < b.X
+		}
+		if a.Y != b.Y {
+			return a.Y < b.Y
+		}
+		return !a.IsNodeCenter && b.IsNodeCenter
+	})
+	var lines []string
+	for _, n := range nodes {
+		flags := ""
+		if n.IsNodeCenter {
+			flags += "c"
+		}
+		if n.IsTunnel {
+			flags += "t"
+		}
+		if flags == "" {
+			flags = "-"
+		}
+		var ports []string
+		for o, m := range n.portOwners() {
+			centre := 0
+			if m.isCenterPort {
+				centre = 1
+			}
+			ports = append(ports, fmt.Sprintf("%03d:%s:%d", owner[o], directionLetters(m.directions), centre))
+		}
+		sort.Strings(ports)
+		var near []string
+		for o := range n.IsNearPort {
+			near = append(near, fmt.Sprintf("%03d", owner[o]))
+		}
+		sort.Strings(near)
+		var adjacent []string
+		for _, e := range n.Edges {
+			adjacent = append(adjacent, pt(n.adjacent(e)))
+		}
+		lines = append(lines, fmt.Sprintf("N %d %d %s P %s K %s A %s", q(t, n.X), q(t, n.Y), flags,
+			strings.Join(ports, ","), strings.Join(near, ","), strings.Join(adjacent, " ")))
+	}
+	for _, e := range ovg.Edges {
+		lines = append(lines, fmt.Sprintf("E %d %d %d %d", q(t, e.From.X), q(t, e.From.Y), q(t, e.To.X), q(t, e.To.Y)))
+	}
+	for i, n := range g.Nodes {
+		var ports []string
+		for _, p := range ovg.Ports[n] {
+			ports = append(ports, pt(p))
+		}
+		lines = append(lines, fmt.Sprintf("O %d %s", i, strings.Join(ports, " ")))
+	}
+	for i, n := range g.Nodes {
+		lines = append(lines, fmt.Sprintf("C %d %s", i, pt(ovg.Centers[n])))
+	}
+	return lines
+}
+
+// The last one is the size of a card in the editor. The small ones have ports closer to each other
+// and to the centre than the proximity threshold.
+var ovgSizes = [][2]float64{{160, 80}, {300, 200}, {150, 90}, {121, 77}, {64, 64}, {40, 30}, {50, 50}, {220, 120}}
+
+func ovgKeepsGap(cards []ovgCard, c ovgCard, gap float64) bool {
+	for _, o := range cards {
+		if c.X < o.X+o.Width+gap && o.X < c.X+c.Width+gap && c.Y < o.Y+o.Height+gap && o.Y < c.Y+c.Height+gap {
+			return false
+		}
+	}
+	return true
+}
+
+func ovgRandomLinks(r *rand.Rand, cards int, max int) [][2]int {
+	links := [][2]int{}
+	if cards < 2 {
+		return links
+	}
+	for i := r.Intn(max + 1); i > 0; i-- {
+		a, b := r.Intn(cards), r.Intn(cards)
+		if a != b {
+			links = append(links, [2]int{a, b})
+		}
+	}
+	return links
+}
+
+func TestExportOVGReference(t *testing.T) {
+	out := os.Getenv("OVG_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set OVG_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(2026112103))
+	var cases []ovgCase
+
+	// Scattered: cards anywhere, at least 20 apart, most of them 220 by 120.
+	for i := 0; i < 260; i++ {
+		count := 2 + r.Intn(8)
+		if i < 30 {
+			count = 1 + r.Intn(4)
+		}
+		offGrid := i%5 == 4
+		span := 300 + 260*count
+		c := ovgCase{Kind: "scattered"}
+		for len(c.Cards) < count {
+			size := ovgSizes[len(ovgSizes)-1]
+			if r.Intn(10) < 3 {
+				size = ovgSizes[r.Intn(len(ovgSizes))]
+			}
+			card := ovgCard{Width: size[0], Height: size[1]}
+			if offGrid {
+				card.X, card.Y = float64(r.Intn(span)-200), float64(r.Intn(span*2/3)-200)
+			} else {
+				card.X, card.Y = float64(20*(r.Intn(span/20)-10)), float64(20*(r.Intn(span/30)-10))
+			}
+			if ovgKeepsGap(c.Cards, card, 20) {
+				c.Cards = append(c.Cards, card)
+			}
+		}
+		c.Links = ovgRandomLinks(r, count, 2*count)
+		cases = append(cases, c)
+	}
+
+	// Rows and columns: cards of 220 by 120 with the same gap everywhere, some places empty,
+	// connections mostly between neighbours. This is where tunnels and blocked ports show up.
+	gaps := []float64{20, 40, 60, 100, 140}
+	for i := 0; i < 140; i++ {
+		cols, rows := 1+r.Intn(4), 1+r.Intn(4)
+		gapX, gapY := gaps[r.Intn(len(gaps))], gaps[r.Intn(len(gaps))]
+		c := ovgCase{Kind: "rows"}
+		at := map[[2]int]int{}
+		for row := 0; row < rows; row++ {
+			for col := 0; col < cols; col++ {
+				if r.Intn(5) == 0 {
+					continue
+				}
+				at[[2]int{col, row}] = len(c.Cards)
+				c.Cards = append(c.Cards, ovgCard{X: float64(col) * (220 + gapX), Y: float64(row) * (120 + gapY), Width: 220, Height: 120})
+			}
+		}
+		if len(c.Cards) == 0 {
+			i--
+			continue
+		}
+		c.Links = [][2]int{}
+		for row := 0; row < rows; row++ {
+			for col := 0; col < cols; col++ {
+				from, ok := at[[2]int{col, row}]
+				if !ok {
+					continue
+				}
+				for _, d := range [][2]int{{1, 0}, {0, 1}, {2, 0}, {0, 2}, {1, 1}} {
+					to, ok := at[[2]int{col + d[0], row + d[1]}]
+					if !ok || r.Intn(3) == 0 {
+						continue
+					}
+					for n := 1 + r.Intn(5)/4*r.Intn(3); n > 0; n-- {
+						if r.Intn(2) == 0 {
+							c.Links = append(c.Links, [2]int{from, to})
+						} else {
+							c.Links = append(c.Links, [2]int{to, from})
+						}
+					}
+				}
+			}
+		}
+		c.Links = append(c.Links, ovgRandomLinks(r, len(c.Cards), 2)...)
+		cases = append(cases, c)
+	}
+
+	// Between: two cards that face each other from far away, with several connections, and small
+	// cards in the space between them. They cut the stretch for tunnels into pieces.
+	for i := 0; i < 80; i++ {
+		c := ovgCase{Kind: "between"}
+		distance := float64(20 * (10 + r.Intn(30)))
+		length := float64(20 * (8 + r.Intn(20)))
+		sideways := i%2 == 0
+		a := ovgCard{Width: 220, Height: length}
+		b := ovgCard{X: 220 + distance, Y: float64(20 * (r.Intn(9) - 4)), Width: 220, Height: length}
+		if !sideways {
+			a = ovgCard{Width: length, Height: 120}
+			b = ovgCard{X: float64(20 * (r.Intn(9) - 4)), Y: 120 + distance, Width: length, Height: 120}
+		}
+		c.Cards = append(c.Cards, a, b)
+		for tries := 0; tries < 40 && len(c.Cards) < 2+1+r.Intn(4); tries++ {
+			size := ovgSizes[r.Intn(len(ovgSizes))]
+			small := ovgCard{Width: size[0], Height: size[1]}
+			if r.Intn(4) == 0 {
+				small.Width, small.Height = float64(20*(1+r.Intn(4))), float64(20*(1+r.Intn(4)))
+			}
+			if sideways {
+				small.X, small.Y = 220+float64(20*r.Intn(int(distance)/20)), float64(20*(r.Intn(int(length)/20+8)-4))
+			} else {
+				small.X, small.Y = float64(20*(r.Intn(int(length)/20+8)-4)), 120+float64(20*r.Intn(int(distance)/20))
+			}
+			if ovgKeepsGap(c.Cards, small, 20) {
+				c.Cards = append(c.Cards, small)
+			}
+		}
+		c.Links = [][2]int{}
+		for n := 1 + r.Intn(5); n > 0; n-- {
+			if r.Intn(2) == 0 {
+				c.Links = append(c.Links, [2]int{0, 1})
+			} else {
+				c.Links = append(c.Links, [2]int{1, 0})
+			}
+		}
+		c.Links = append(c.Links, ovgRandomLinks(r, len(c.Cards), 2)...)
+		cases = append(cases, c)
+	}
+
+	dumps := [2]int{}
+	for i := range cases {
+		c := &cases[i]
+		g := layoutgraph.NewGraph()
+		nodes := make([]*layoutgraph.Node, 0, len(c.Cards))
+		for n, card := range c.Cards {
+			node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), card.Width, card.Height))
+			node.TopLeft = geo.NewPoint(card.X, card.Y)
+			nodes = append(nodes, node)
+		}
+		for _, link := range c.Links {
+			g.Connect(nodes[link[0]], nodes[link[1]])
+		}
+		g.ComputeCellSize()
+		ovg, err := buildOVGFromGraphWithLimits(context.Background(), g, nil, defaultOVGBuildLimits())
+		if err != nil {
+			t.Fatalf("case %d: %v", i, err)
+		}
+		dump := dumpOVG(t, ovg, g)
+		h := fnv.New64a()
+		h.Write([]byte(strings.Join(dump, "\n")))
+		c.Nodes, c.Edges, c.Hash = len(ovg.Nodes), len(ovg.Edges), fmt.Sprintf("%016x", h.Sum64())
+		for _, n := range ovg.Nodes {
+			if n.IsTunnel {
+				c.Tunnels++
+			}
+			if len(n.IsNearPort) > 0 {
+				c.Near++
+			}
+		}
+		// Full text for a few small cases, half of them with tunnels: it shows where a port differs.
+		tunnelled := 0
+		if c.Tunnels > 0 {
+			tunnelled = 1
+		}
+		if len(c.Cards) <= 3 && len(dump) < 400 && dumps[tunnelled] < 10 {
+			dumps[tunnelled]++
+			c.Dump = dump
+		}
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
+
+type passCase struct {
+	Card   ovgCard    `json:"card"`
+	From   [2]float64 `json:"from"`
+	To     [2]float64 `json:"to"`
+	Passes bool       `json:"passes"`
+}
+
+// What Node.PassesThrough answers for a segment and a card: segments along a border, through a
+// corner, touching a corner from outside, ending on the border, and anywhere.
+func TestExportPassesThroughReference(t *testing.T) {
+	out := os.Getenv("PASSES_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set PASSES_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(2026112104))
+	var cases []passCase
+	for i := 0; i < 600; i++ {
+		card := ovgCard{X: float64(10 * (r.Intn(20) - 10)), Y: float64(10 * (r.Intn(20) - 10)), Width: float64(10 * (1 + r.Intn(20))), Height: float64(10 * (1 + r.Intn(20)))}
+		xs := []float64{card.X - 30, card.X - 10, card.X, card.X + card.Width/2, card.X + card.Width, card.X + card.Width + 10, card.X + card.Width + 30}
+		ys := []float64{card.Y - 30, card.Y - 10, card.Y, card.Y + card.Height/2, card.Y + card.Height, card.Y + card.Height + 10, card.Y + card.Height + 30}
+		c := passCase{Card: card}
+		switch i % 3 {
+		case 0:
+			// Any two points of a grid laid over the card and around it.
+			c.From = [2]float64{xs[r.Intn(7)], ys[r.Intn(7)]}
+			c.To = [2]float64{xs[r.Intn(7)], ys[r.Intn(7)]}
+		case 1:
+			// A diagonal through one corner: it touches the card there and nowhere else.
+			right, bottom := r.Intn(2) == 0, r.Intn(2) == 0
+			cx, cy := card.X, card.Y
+			if right {
+				cx += card.Width
+			}
+			if bottom {
+				cy += card.Height
+			}
+			dx, dy := float64(10*(1+r.Intn(3))), float64(10*(1+r.Intn(3)))
+			if right == bottom {
+				// Top left or bottom right corner: the line rises to the right.
+				dy = -dy
+			}
+			c.From = [2]float64{cx - dx, cy - dy}
+			c.To = [2]float64{cx + dx, cy + dy}
+		default:
+			c.From = [2]float64{float64(r.Intn(400) - 200), float64(r.Intn(400) - 200)}
+			c.To = [2]float64{float64(r.Intn(400) - 200), float64(r.Intn(400) - 200)}
+		}
+		node := layoutgraph.NewNode(1, card.Width, card.Height)
+		node.TopLeft = geo.NewPoint(card.X, card.Y)
+		c.Passes = node.PassesThrough(geo.NewPoint(c.From[0], c.From[1]), geo.NewPoint(c.To[0], c.To[1]))
+		cases = append(cases, c)
+	}
+	result, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, result, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}

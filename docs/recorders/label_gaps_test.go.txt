@@ -1,0 +1,118 @@
+package placement
+
+// Reference cases for the Rust port tidy-layout: the gap two
+// cards keep when the connection between them carries a label. Not part of TALA: it only calls
+// TALA's own functions and records what they answer.
+
+import (
+	"context"
+	"encoding/json"
+	"math/rand"
+	"os"
+	"testing"
+
+	"github.com/d2lang/d2/d2layouts/d2talalayout/internal/layoutgraph"
+	"github.com/d2lang/d2/lib/geo"
+)
+
+type refLabelEdge struct {
+	From      int `json:"from"`
+	To        int `json:"to"`
+	MinWidth  int `json:"minWidth"`
+	MinHeight int `json:"minHeight"`
+}
+
+type refGap struct {
+	Other int        `json:"other"`
+	At    [2]float64 `json:"at"`
+	Gap   int        `json:"gap"`
+}
+
+type refLabelCase struct {
+	CellSize float64        `json:"cellSize"`
+	Nodes    []refNode      `json:"nodes"`
+	Edges    []refLabelEdge `json:"edges"`
+	Moving   int            `json:"moving"`
+	// Gaps: what DeltaTo answers for the moving card placed at a point, against another card.
+	Gaps  []refGap   `json:"gaps"`
+	Point [2]float64 `json:"point"`
+	// Distance and Found: as in the reference without labels.
+	Distance float64     `json:"distance"`
+	Found    *[2]float64 `json:"found"`
+}
+
+func TestExportLabelGapReference(t *testing.T) {
+	out := os.Getenv("LABEL_REFERENCE_OUT")
+	if out == "" {
+		t.Skip("set LABEL_REFERENCE_OUT to write the reference cases")
+	}
+	r := rand.New(rand.NewSource(2026112102))
+	var cases []refLabelCase
+	for i := 0; i < 500; i++ {
+		// The last 100 cases have labels that are taller than wide (a rotated or stacked label).
+		tall := i >= 400
+		g := layoutgraph.NewGraph()
+		count := 2 + r.Intn(14)
+		nodes := make([]*layoutgraph.Node, 0, count)
+		c := refLabelCase{}
+		for n := 0; n < count; n++ {
+			node := addTopLevel(g, layoutgraph.NewNode(layoutgraph.EntityID(n+1), 220, 120))
+			node.TopLeft = geo.NewPoint(float64(20*(r.Intn(80)-10)), float64(20*(r.Intn(55)-10)))
+			nodes = append(nodes, node)
+			c.Nodes = append(c.Nodes, refNode{n + 1, node.TopLeft.X, node.TopLeft.Y, 220, 120})
+		}
+		for e := 0; e < 1+r.Intn(count*2); e++ {
+			a, b := r.Intn(count), r.Intn(count)
+			if a == b {
+				continue
+			}
+			edge := g.Connect(nodes[a], nodes[b])
+			// Two thirds carry a label: its box plus padding, as TALA's adapter sets it.
+			if r.Intn(3) > 0 {
+				edge.MinWidth = 30 + r.Intn(260)
+				edge.MinHeight = 20 + r.Intn(50)
+				if tall {
+					edge.MinWidth = r.Intn(70)
+					edge.MinHeight = 70 + r.Intn(160)
+				}
+			}
+			c.Edges = append(c.Edges, refLabelEdge{a + 1, b + 1, edge.MinWidth, edge.MinHeight})
+		}
+		// A fine grid, as the editor uses, so the search meets the label gaps and not only cells.
+		g.CellSize = 20
+		optim, err := newSizedOptimizer(context.Background(), g, nil, nil, rand.New(rand.NewSource(1)), nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		moving := nodes[r.Intn(count)]
+		c.CellSize = g.CellSize
+		c.Moving = int(moving.ID)
+		for k := 0; k < 12; k++ {
+			other := nodes[r.Intn(count)]
+			if other == moving {
+				continue
+			}
+			// Around the other card: beside, above, below, on the corners and on top of it.
+			at := geo.NewPoint(other.TopLeft.X+float64(20*(r.Intn(40)-20)), other.TopLeft.Y+float64(20*(r.Intn(26)-13)))
+			c.Gaps = append(c.Gaps, refGap{int(other.ID), [2]float64{at.X, at.Y}, moving.DeltaTo(other, at)})
+		}
+		anchor := nodes[r.Intn(count)]
+		p := geo.NewPoint(anchor.TopLeft.X+float64(r.Intn(500)-250), anchor.TopLeft.Y+float64(r.Intn(300)-150))
+		c.Point = [2]float64{p.X, p.Y}
+		d, err := optim.findClosestUnoccupiedDistanceForTest(context.Background(), moving, p, false, nil)
+		if err != nil {
+			c.Distance = -1
+		} else {
+			c.Distance = d
+			c.Found = firstFreeOnRing(t, optim, moving, p, d)
+		}
+		cases = append(cases, c)
+	}
+	data, err := json.Marshal(cases)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(out, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+}
