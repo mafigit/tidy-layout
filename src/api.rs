@@ -149,6 +149,10 @@ struct Area {
 }
 
 impl Area {
+    fn of_card(card: &Node) -> Area {
+        Area { left: card.top_left.x, top: card.top_left.y, right: card.top_left.x + card.width, bottom: card.top_left.y + card.height }
+    }
+
     fn of_label(place: Point, size: labels::LabelSize) -> Area {
         Area { left: place.x, top: place.y, right: place.x + size.width, bottom: place.y + size.height }
     }
@@ -471,6 +475,161 @@ fn follow_lines(was: &[Vec<Point>], now: &[Vec<Point>], sizes: &[Option<labels::
     }
 }
 
+/// Whether two routes have pieces on one line that share more than a pixel of it.
+fn on_one_line(first: &[Point], second: &[Point]) -> bool {
+    first.windows(2).any(|p| {
+        second.windows(2).any(|q| {
+            let upright = p[0].x == p[1].x;
+            let same_way = (q[0].x == q[1].x) == upright && (p[0].y == p[1].y) == (q[0].y == q[1].y) && p[0] != p[1] && q[0] != q[1];
+            same_way
+                && (across(p[0], upright) - across(q[0], upright)).abs() < 0.5
+                && along(p[0], upright).max(along(p[1], upright)).min(along(q[0], upright).max(along(q[1], upright)))
+                    - along(p[0], upright).min(along(p[1], upright)).max(along(q[0], upright).min(along(q[1], upright)))
+                    > 1.0
+        })
+    })
+}
+
+/// Which labels lie under a line, on a card or on another label.
+fn labels_in_the_way(cards: &[Node], routes: &[Vec<Point>], sizes: &[Option<labels::LabelSize>], places: &[Option<Point>]) -> Vec<bool> {
+    let areas: Vec<Option<Area>> = (0..places.len()).map(|label| Some(Area::of_label(places[label]?, sizes[label]?))).collect();
+    areas
+        .iter()
+        .enumerate()
+        .map(|(label, area)| {
+            let Some(area) = area else { return false };
+            routes.iter().any(|route| route.windows(2).any(|piece| area.crossed_by(piece[0], piece[1], CROSSED_SLACK)))
+                || cards.iter().any(|card| area.overlaps(&Area::of_card(card), CROSSED_SLACK))
+                || areas.iter().enumerate().any(|(other, there)| other != label && there.is_some_and(|there| area.overlaps(&there, CROSSED_SLACK)))
+        })
+        .collect()
+}
+
+/// How many of the cheapest ways to make room are tried for one label.
+const ROOM_TRIES: usize = 24;
+
+/// Ours, not TALA's: where a label still lies in the way after `clear_labels`, lines that run
+/// beside its own line make room for it. A place beside the label's line counts where only
+/// lines of other connections running the same way cross it: those move sideways, away from
+/// the label's line, to just past the label, the next 16 further. The move is kept only if
+/// every moved route still ends on the sides of its cards, runs through no card and lies on
+/// no other line, and if no label that was clear comes to lie in the way. Of the places that
+/// work, the one that moves the lines least is taken; where none works, nothing changes.
+fn make_room(cards: &[Node], edges: &[Edge], routes: &mut Vec<Vec<Point>>, sizes: &[Option<labels::LabelSize>], places: &mut [Option<Point>]) {
+    for label in 0..places.len() {
+        let (Some(_), Some(size)) = (places[label], sizes[label]) else { continue };
+        let was_in_the_way = labels_in_the_way(cards, routes, sizes, places);
+        if !was_in_the_way[label] {
+            continue;
+        }
+        let others: Vec<Area> = (0..places.len())
+            .filter(|other| *other != label)
+            .filter_map(|other| Some(Area::of_label(places[other]?, sizes[other]?)))
+            .collect();
+        // Every place beside the label's line, with the pieces that would have to move and
+        // where to: (how far they move in all, the corner, the moves).
+        let mut ways: Vec<(f64, Point, Vec<(usize, usize, f64)>)> = Vec::new();
+        for piece in routes[label].windows(2) {
+            let (a, b) = (piece[0], piece[1]);
+            if a == b {
+                continue;
+            }
+            let upright = a.x == b.x;
+            let length = if upright { size.height } else { size.width };
+            let thick = if upright { size.width } else { size.height };
+            let (from, to) = (along(a, upright).min(along(b, upright)), along(a, upright).max(along(b, upright)));
+            let mut at = from - length / 2.0;
+            while at <= to - length / 2.0 {
+                for side in [-1.0, 1.0] {
+                    let near = across(a, upright) + side * LABEL_OFF_LINE;
+                    let start = if side < 0.0 { near - thick } else { near };
+                    let corner = if upright { Point { x: start.round(), y: at.round() } } else { Point { x: at.round(), y: start.round() } };
+                    let area = Area::of_label(corner, size);
+                    if cards.iter().any(|card| area.overlaps(&Area::of_card(card), 0.0)) || others.iter().any(|other| area.overlaps(other, 0.0)) {
+                        continue;
+                    }
+                    // What crosses the place: lines the same way can move, anything else rules
+                    // the place out.
+                    let mut in_the_way: Vec<(usize, usize)> = Vec::new();
+                    let mut hopeless = false;
+                    for (route, points) in routes.iter().enumerate() {
+                        for (index, part) in points.windows(2).enumerate() {
+                            if !area.crossed_by(part[0], part[1], 0.0) {
+                                continue;
+                            }
+                            if route == label || (part[0].x == part[1].x) != upright {
+                                hopeless = true;
+                            } else {
+                                in_the_way.push((route, index));
+                            }
+                        }
+                    }
+                    if hopeless || in_the_way.is_empty() {
+                        continue;
+                    }
+                    // The nearest to the label's line goes just past the label, the others
+                    // behind it in their order.
+                    in_the_way.sort_by(|p, q| {
+                        let far = |piece: &(usize, usize)| side * across(routes[piece.0][piece.1], upright);
+                        far(p).total_cmp(&far(q)).then(p.cmp(q))
+                    });
+                    let past = if side < 0.0 { across(corner, upright) - LABEL_OFF_LINE } else { across(corner, upright) + thick + LABEL_OFF_LINE };
+                    let mut moves = Vec::new();
+                    let mut cost = 0.0;
+                    let mut fits = true;
+                    for (n, (route, index)) in in_the_way.iter().enumerate() {
+                        let line = (past + side * n as f64 * LINE_GAPS[0]).round();
+                        let points = &routes[*route];
+                        let (mut least, mut most) = (f64::NEG_INFINITY, f64::INFINITY);
+                        if *index == 0 {
+                            let (low, high) = room_on_side(&cards[edges[*route].from], points[0], upright);
+                            (least, most) = (least.max(low), most.min(high));
+                        }
+                        if index + 2 == points.len() {
+                            let (low, high) = room_on_side(&cards[edges[*route].to], points[points.len() - 1], upright);
+                            (least, most) = (least.max(low), most.min(high));
+                        }
+                        fits &= least <= line && line <= most;
+                        cost += (line - across(points[*index], upright)).abs();
+                        moves.push((*route, *index, line));
+                    }
+                    if fits {
+                        ways.push((cost, corner, moves));
+                    }
+                }
+                at += LABEL_STEP;
+            }
+        }
+        // The cheapest first; of equal ones the first found, so the answer is always the same.
+        ways.sort_by(|p, q| p.0.total_cmp(&q.0));
+        for (_, corner, moves) in ways.into_iter().take(ROOM_TRIES) {
+            let (held_routes, held_places) = (routes.clone(), places.to_vec());
+            for (route, index, line) in &moves {
+                let upright = held_routes[*route][*index].x == held_routes[*route][*index + 1].x;
+                for point in [*index, *index + 1] {
+                    let moved = &mut routes[*route][point];
+                    if upright { moved.x = *line } else { moved.y = *line }
+                }
+            }
+            follow_lines(&held_routes, routes, sizes, places);
+            places[label] = Some(corner);
+            let moved: Vec<usize> = moves.iter().map(|change| change.0).collect();
+            let sound = moved.iter().all(|route| {
+                !routes[*route].windows(2).any(|part| cards.iter().any(|card| through(card, part[0], part[1])))
+                    && (0..routes.len()).all(|other| other == *route || !on_one_line(&routes[*route], &routes[other]))
+            });
+            let now_in_the_way = labels_in_the_way(cards, routes, sizes, places);
+            let no_worse = !now_in_the_way[label] && (0..places.len()).all(|other| was_in_the_way[other] || !now_in_the_way[other]);
+            if sound && no_worse {
+                break;
+            }
+            *routes = held_routes;
+            places.copy_from_slice(&held_places);
+        }
+    }
+    routes.iter_mut().for_each(tidy);
+}
+
 /// "How do the connectors run?"
 #[derive(Deserialize)]
 pub struct RouteRequest {
@@ -552,6 +711,7 @@ pub fn route(request: &RouteRequest) -> Result<RouteResponse, String> {
     separate_lines(&graph.nodes, &graph.edges, &mut kept);
     follow_lines(&ported, &kept, &sizes, &mut places);
     clear_labels(&graph.nodes, &kept, &sizes, &mut places);
+    make_room(&graph.nodes, &graph.edges, &mut kept, &sizes, &mut places);
     let routes = edge_of
         .iter()
         .map(|edge| match edge {

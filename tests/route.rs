@@ -368,6 +368,48 @@ fn a_label_under_a_line_moves_to_the_nearest_free_place_beside_its_own_line() {
     assert_eq!(label_trouble(&request, &answer), Vec::<String>::new());
 }
 
+/// Ours: three lines stand 55 apart between two cards, and the label of the middle one, 89
+/// wide, fits beside none of them: TALA leaves it on its own line. The line to its left makes
+/// room: it moves 46 further left, still on the sides of its cards, and its own label goes
+/// with it.
+#[test]
+fn a_line_beside_a_label_makes_room_for_it() {
+    let request = request(json!({
+        "cards": [card("a", 140.0, 160.0), card("b", 140.0, 560.0)],
+        "connections": [
+            { "from": "a", "to": "b", "label": { "width": 89, "height": 22 } },
+            { "from": "b", "to": "a", "label": { "width": 187, "height": 22 } },
+            { "from": "b", "to": "a", "label": { "width": 168, "height": 22 } },
+        ],
+    }));
+    let before = ported(&request);
+    assert_eq!(points(&before.routes[1]), vec![(195.0, 560.0), (195.0, 280.0)]);
+    assert_eq!(before.labels, vec![Some(Position { x: 206.0, y: 409.0 }), Some(Position { x: 2.0, y: 409.0 }), Some(Position { x: 312.0, y: 409.0 })]);
+    assert_eq!(label_trouble(&request, &before), vec!["label 0 is crossed by the line of connection 0".to_string()]);
+
+    let answer = route(&request).unwrap();
+    assert_eq!(points(&answer.routes[0]), points(&before.routes[0]));
+    assert_eq!(points(&answer.routes[1]), vec![(149.0, 560.0), (149.0, 280.0)]);
+    assert_eq!(points(&answer.routes[2]), points(&before.routes[2]));
+    assert_eq!(answer.labels, vec![Some(Position { x: 155.0, y: 281.0 }), Some(Position { x: -44.0, y: 409.0 }), Some(Position { x: 312.0, y: 409.0 })]);
+    assert_eq!(label_trouble(&request, &answer), Vec::<String>::new());
+}
+
+/// A layout found by search (2026-11-24): making room for a label, the line of connection 5
+/// would come to lie on the line of connection 7. That way is not taken.
+#[test]
+fn a_line_that_makes_room_never_lands_on_another_line() {
+    let places = [(140.0, 560.0), (500.0, 240.0), (40.0, 160.0), (700.0, 440.0)];
+    let joined = [(1, 0), (0, 1), (0, 3), (3, 1), (3, 1), (3, 2), (0, 1), (3, 1), (0, 1), (0, 3)];
+    let cards: Vec<Value> = places.iter().enumerate().map(|(n, place)| card(&n.to_string(), place.0, place.1)).collect();
+    let wires: Vec<Value> = joined
+        .iter()
+        .map(|(from, to)| json!({ "from": from.to_string(), "to": to.to_string(), "label": { "width": 60 + (from * 37 + to * 53) % 180, "height": 22 } }))
+        .collect();
+    let answer = route(&request(json!({ "cards": cards, "connections": wires }))).unwrap();
+    assert_eq!(shared_lines(&answer), Vec::<String>::new());
+}
+
 /// A diagram of 23 cards as an editor had it. Three lines run upright 55 apart, and the label of
 /// the middle one is 183 wide: no place beside its line is free, so it stays where TALA put it,
 /// under the line of another connection. Every other label is clear.
@@ -385,7 +427,7 @@ fn a_label_with_no_free_place_beside_its_line_stays_where_it_was() {
 fn labels_lie_under_fewer_lines_than_in_talas_answer() {
     let mut random = Random(20261124);
     let count = |trouble: &[String], what: &str| trouble.iter().filter(|line| line.contains(what)).count();
-    let (mut crossed, mut covering) = ((0, 0), (0, 0));
+    let (mut crossed, mut covering, mut everything) = ((0, 0), (0, 0), 0.0);
     for round in 0..400 {
         let gap = if round % 2 == 0 { 60.0 } else { 20.0 };
         let mut places: Vec<(f64, f64)> = Vec::new();
@@ -408,13 +450,21 @@ fn labels_lie_under_fewer_lines_than_in_talas_answer() {
             }
         }
         let request = request(json!({ "cards": cards, "connections": wires }));
-        let (was, is) = (label_trouble(&request, &ported(&request)), label_trouble(&request, &route(&request).unwrap()));
+        let answer = route(&request).unwrap();
+        let (was, is) = (label_trouble(&request, &ported(&request)), label_trouble(&request, &answer));
         crossed = (crossed.0 + count(&was, "is crossed"), crossed.1 + count(&is, "is crossed"));
         covering = (covering.0 + count(&was, "lies on"), covering.1 + count(&is, "lies on"));
+        // Lines that make room for a label come to lie on no other line.
+        assert_eq!(shared_lines(&answer), Vec::<String>::new());
+        // Where all lines and labels are, in one number: any that goes elsewhere changes it.
+        let lines: f64 = answer.routes.iter().flatten().map(|point| point.x + 3.0 * point.y).sum();
+        let labels: f64 = answer.labels.iter().flatten().map(|place| 5.0 * place.x + 7.0 * place.y).sum();
+        everything += lines + labels;
     }
+    assert_eq!(everything, 29990530.0);
     // Pinned: counted once, 2026-11-24, as (TALA's answer, ours). A label under two lines
     // counts twice. A change here means lines or labels go to other places.
-    assert_eq!((crossed, covering), ((153, 103), (94, 93)));
+    assert_eq!((crossed, covering), ((153, 69), (94, 93)));
 }
 
 /// Which routes lie on each other, in words: two connections with pieces on one line that share

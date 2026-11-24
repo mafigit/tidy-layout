@@ -9,13 +9,14 @@ with a small API of its own on top. It is not affiliated with or endorsed by Ter
 
 - `arrange`: places for all cards, as TALA arranges a diagram (the best of its three seeds).
 - `route`: connectors around the cards, at right angles, with places for their labels.
-  Different from TALA in two things:
+  Different from TALA in these things:
   - No two connectors lie on one line. TALA lets connections of one card share an end and the
     line from it; here each gets its own line, 16 apart (closer where a card is in the way),
     and its own end on the card's side.
   - A label that would lie under a line, on a card or on another label moves to the nearest
-    place beside its own line that is clear of all of them. Where there is none (lines too
-    close together for the label) it stays.
+    place beside its own line that is clear of all of them. Where there is none, lines that
+    run beside its line move aside to make room for it, if they can. Where they cannot (their
+    ends have no room on their cards) the label stays.
 - `snap`: the free place nearest to where a card is dropped.
 
 For the same diagram and seed the port gives the drawing TALA gives: the tests replay answers
