@@ -4,9 +4,8 @@ This crate is a Rust port of parts of **TALA**, the layout engine of [D2](https:
 (`d2layouts/d2talalayout`), Copyright Terrastruct Inc. and the D2 authors, licensed under the
 Mozilla Public License 2.0.
 
-It is a translation of that source, so it stays under the **MPL-2.0** (see `LICENSE`), separate from
-the licence of the rest of this repository. Whoever ships the built engine must make this source
-available.
+It is a translation of that source, so it stays under the **MPL-2.0** (see `LICENSE`). Whoever
+ships the built engine must make this source available.
 
 `src/gorand.rs` is a port of Go's `math/rand` (the seeded generator and its table) and
 `src/gosort.rs` of Go's `sort.Slice`, Copyright The Go Authors, under Go's BSD-style licence: see
